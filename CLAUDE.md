@@ -38,7 +38,7 @@ tags: [ruler, ssot, invariants, repo-root]
 
 ---
 
-## 불변 사항 (재설계 plan 이 절대 건드리지 않는 전제)
+## 핵심 유지 사항 (Immutable Constraints — 재설계 plan 이 절대 건드리지 않는 전제)
 
 ### Identity / Lifecycle
 - **patrol 세션**: `ruler` psmux 세션, Sonnet (force_opus_fallback 시 opus), cwd=`C:\Users\jsh86\.claude`, **장수명 (며칠~몇 주)**. 3분 wake 루프, 30분마다 Tier C.

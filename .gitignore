@@ -1,4 +1,9 @@
+# Repo-root 런타임 플래그
+.wf-active
+.home-cwd-warning
+
 # Ruler 런타임 상태 (세션이 append/rewrite)
+.ruler/.active
 .ruler/.cycle
 .ruler/.idle-strike
 .ruler/.last-patrol-ts
