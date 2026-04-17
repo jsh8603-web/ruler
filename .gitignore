@@ -1,6 +1,7 @@
 # Repo-root 런타임 플래그
 .wf-active
 .home-cwd-warning
+.ultraplan-nudge
 
 # Ruler 런타임 상태 (세션이 append/rewrite)
 .ruler/.active

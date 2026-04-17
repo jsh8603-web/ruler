@@ -32,19 +32,13 @@ tags: [ruler, retrospective, progress]
   - 완료 판정: grep `'Phase A.*Phase B.*Phase C.*Phase Final.*Phase Terminal'` (multiline) 매치 + 기존 Phase 표기 잔존 0건 (`grep -c 'Phase D'` = 0, `grep -c '기존 Phase'` = 0).
   - Sonnet-executable 5항목: (1) 경로 ✅ (2) 라인은 Step 진입 시 grep 선행 (3) before/after = "현행 문자열 → 새 Phase 순서" (4) 경계 명시 ✅ (5) 판정 grep ✅.
 
-- [ ] **Step 3 — `.ruler/scripts/retrospective-collect.sh` Δ 수집 + 교차 비교 JSON 추가** (model: sonnet)
+- [ ] **Step 3 — `.ruler/scripts/retrospective-collect.sh` Δ 수집 + verdict 통합** (model: sonnet)
   - 파일: `D:/projects/ruler/.ruler/scripts/retrospective-collect.sh`
-  - 변경: (a) pre-T / post-T 각 3.5일 윈도우 `decisions.jsonl` 서브셋 추출 블록 신규. 출력: `/tmp/retro-{ts}/pre-{check}-{file}.json`, `post-{check}-{file}.json`. (b) §0.5 누락 감사용 교차 비교: `find -mtime -7 (plan §3.3 Step1 범위)` ∖ `jq '.file' decisions.jsonl` → `missing-files.json` append. 기존 `--window 7d --out` 인터페이스 유지.
+  - 변경: (a) pre-T / post-T 각 3.5일 윈도우 `decisions.jsonl` 서브셋 추출 블록 신규. 출력: `/tmp/retro-{ts}/pre-{check}-{file}.json`, `post-{check}-{file}.json`. (b) §0.5 누락 감사용 교차 비교: `find -mtime -7 (plan §3.3 Step1 범위)` ∖ `jq '.file' decisions.jsonl` → `missing-files.json` append. (c) **`compute_change_impact()` bash 함수 신규** — `decisions.jsonl` + `~/.claude/audit-log/{date}.jsonl` 파싱 → T 시점별 pre/post Δ 계산 → verdict (GOOD/NEUTRAL/BAD/INSUFFICIENT) 산출 → `.ruler/retrospective/{date}_change-impact.md` 표 렌더 (`| T | file | tier | action | verdict | Δ summary |`). INSUFFICIENT 게이트는 단순 `if N<10` (Poisson 신뢰구간 생략, §7.2 Q1 Cost 권고 채택). Phase A `verdict_observation_only: true` 모드 (첫 4주) 배너 출력 포함. (d) 기존 `--window 7d --out` 인터페이스 유지.
   - 건들지 말 것: `--window`/`--out` 플래그 파싱, 기존 R1~R11 수집 블록, 스크립트 실행권한.
-  - 완료 판정: (a) `bash .ruler/scripts/retrospective-collect.sh --window 7d --out /tmp/retro-test.json` 실행 성공 (b) 출력 JSON 에 `pre_window` / `post_window` / `missing_files` 키 존재 (`jq 'has("pre_window")'` = true).
-  - Sonnet-executable 5항목: (1) 경로 ✅ (2) 라인 = "기존 R 수집 블록 이후 append" (3) before/after = 신규 bash 블록 추가 (4) 경계 ✅ (5) 판정 jq ✅.
-
-- [ ] **Step 4 — `.ruler/scripts/change-impact.py` 신규 작성** (model: opus)
-  - 파일: `D:/projects/ruler/.ruler/scripts/change-impact.py` (신규)
-  - 기능: `decisions.jsonl` + `~/.claude/audit-log/{date}.jsonl` 파싱 → T 시점별 pre/post Δ 계산 → verdict (GOOD/NEUTRAL/BAD/INSUFFICIENT) 산출 → `.ruler/retrospective/{date}_change-impact.md` 표 렌더. 인자: `--decisions <path> --audit-log-dir <path> --window-days 3.5 --out <md path>`.
-  - 건들지 말 것: 기존 `.ruler/scripts/` 내부 다른 파일 (event-patrol.py, retrospective-collect.sh 등).
-  - 완료 판정: (a) 구문 체크 `python -m py_compile .ruler/scripts/change-impact.py` (b) dry-run `python .ruler/scripts/change-impact.py --decisions .ruler/decisions.jsonl --out /tmp/ci-test.md` 성공 (c) 출력 md 에 plan §3.2 표 포맷 (`| T | file | tier | action | verdict | Δ summary |`) 존재.
-  - 사유 (opus): 판정 임계값·window 정의·데이터 스키마 설계 포함. ±20% / INSUFFICIENT 판정 경계 케이스 판단 필요.
+  - 완료 판정: (a) `bash .ruler/scripts/retrospective-collect.sh --window 7d --out /tmp/retro-test.json` 실행 성공 (b) 출력 JSON 에 `pre_window` / `post_window` / `missing_files` 키 존재 (`jq 'has("pre_window")'` = true) (c) 출력 md (`retrospective/{date}_change-impact.md`) 에 plan §3.2 표 포맷 + observation-only 배너 존재.
+  - Sonnet-executable 5항목: (1) 경로 ✅ (2) 라인 = "기존 R 수집 블록 이후 append + verdict 함수 별도 블록" (3) before/after = 신규 bash 블록 + 신규 함수 (4) 경계 ✅ (5) 판정 jq+grep ✅.
+  - 사유 (§7.2 Q1 반영): Python 제거 → bash+jq+awk 통합, model opus→sonnet 강등 (기계적 구현 + 판정 임계값은 단순 `N<10`).
 
 - [ ] **Step 5 — `~/.claude/skills/ruler-wf/skill.md` §5b 보완** (model: sonnet)
   - 파일: `C:/Users/jsh86/.claude/skills/ruler-wf/skill.md`
@@ -72,9 +66,58 @@ tags: [ruler, retrospective, progress]
 
 ## Working Notes (세션 간 전달)
 
-- 마지막 결정: plan.md §8 step 라우팅을 progress.md 7-step 으로 확정. Step 7 smoke test 추가 (plan §6 검증 항목 중 1번).
-- 다음 의도: 사용자 승인 후 Step 1 (opus direct) 착수. 그 전에 §0.6 grep gate (`grep '"file":"retrospective-guide.md"' .ruler/decisions.jsonl | tail -5`).
-- 동기화 필요:
-  - Step 2/3 진입 시 grep 으로 정확한 라인 범위 확정 후 §Steps 블록 업데이트.
-  - Step 4 완료 후 `scripts/change-impact.py` 를 plan §5 편집 대상 표 #4 에 파일 크기/라인 수 기록 (plan §7 "150 라인 내외 예상" 실측).
-  - 각 Edit 직후 `.ruler/decisions.jsonl` + `.ruler/log/2026-04-18.md` 3단 기록 (§0.5).
+### 2026-04-18T02:48 KST NUDGE_1 (102% tok) — 강제 compact 핸드셰이크
+
+- 직전 turn 에서 §7.2 Supervisor 잠정 판정 (Q1 bash통합 / Q2 4주 관찰 / Q3 R# 보조 1줄) plan.md 에 기록 완료. 사용자가 추가로 §부록 Code-Context-Packet 구조 수동 편집 (line 1-33 prepend) — 본 세션 분석 변경 없음, 이어받을 다음 세션이 §부록 인지하면 됨.
+- 핸드셰이크 flag 파일 생성 + COMPACT_READY echo 직후 secretary 가 `/compact` 주입 → 압축 리줌이 progress.md + plan.md §7.2 + MEMORY.md ckpt 로 맥락 복원.
+- 다음 세션 첫 행동: cloud session_014GGwaNRmFuBjhzyMtduAs9 결과 (가설 A vs B) 사용자에게 확인 요청 → §7.2 정식 채택 또는 cloud 결과 덮어쓰기 결정.
+
+---
+
+### 2026-04-18T02:46 KST 체크포인트 (95% tok) — `/ultraplan refine plan.md` 재호출
+
+**상황**:
+- 사용자가 `/ultraplan refine plan.md` 재호출. cloud session URL: `https://claude.ai/code/session_014GGwaNRmFuBjhzyMtduAs9` (이전 시도 동일 URL — `ruler-ul-test` 신규 psmux 세션 검증 결과 4초만에 응답).
+- secretary 95% warn 넛지 도착 → 저장+계속 명령. 중지 금지.
+- 현재 모델 unknown (likely Sonnet 잔존). 컨텍스트 236.7k → §E B 조건 (sonnet 누적 <100k) 미충족 → **Opus 전환 불가**.
+
+**행동 결정**:
+- cloud /ultraplan 결과 대기 + 본 세션은 **로컬 fallback (가설 B 시나리오) 잠정 판정** 을 plan.md §7.2 에 미리 기록. cloud 가 ruler 접근 가능하면 (가설 A) cloud 결과로 §7.2 덮어씀, 불가하면 (가설 B) §7.2 가 정식 결정.
+- §7.1 Q1/Q2/Q3 잠정 판정은 이전 체크포인트 §동기화필요 에 이미 sketch 됨 (Q1=Cost채택 / Q2=절충안 / Q3=(a) Cost축소안). 본 턴에서 plan.md §7.2 로 정식 기록.
+
+**다음 의도**:
+- 사용자가 cloud 결과 (ruler/Button workspace) 확인 받으면:
+  - 가설 A → cloud 결과로 §7.2 덮어쓰고 Phase 3 (구현) 진입 plan
+  - 가설 B → §7.2 잠정 판정 정식화, Phase 2α skip 후 Phase 3 진입
+- 어느 쪽이든 240k compact 후 다음 세션이 §7.2 를 baseline 으로 이어받음
+
+**동기화 필요**:
+- plan.md §7.2 작성 후 sec-msg-* 임시 저장 → 압축 리줌이 §B5 supplement 로 복원 가능
+- `ruler-ul-test` 세션은 cloud 결과 확인 후 정리 대상
+
+---
+
+### 2026-04-18T02:44 KST 체크포인트 (93% tok)
+
+**마지막 결정/발견**:
+- Phase 1 Agent Team 3개 완료 (TA/DA/Cost) → plan.md §6.5 ACCEPT 13건 반영 / §7.1 DEFER 3건 Open
+- Phase 2α ultraplan 1차 시도: cloud workspace = Button WOL Web App 에 고정. `/ultraplan refine D:/projects/ruler/plan.md` send 됐으나 원격은 Button bundle 로 workspace 설정 → `D:/projects/ruler/` 접근 불가 → 사용자에게 Paste/Cancel AskUserQuestion 팝업 → 사용자 interrupted
+- 원인 가설: (A) session id 기반 repo 결정 → 새 psmux 세션 교체로 해결 / (B) Claude Code account-level workspace state 고정 (직전 button /ultraplan 호출 유산) → 로컬 수정 불가
+- 가설 검증 스크립트 `/tmp/ultraplan-ws-test.sh` 실행 완료. 신규 psmux 세션 `ruler-ul-test` (cwd=D:\projects\ruler) 에서 Claude spawn + /ultraplan refine plan.md 호출. 4초만에 URL 감지
+- **URL**: `https://claude.ai/code/session_014GGwaNRmFuBjhzyMtduAs9`
+- **사용자 확인 대기 중**: 브라우저에서 위 URL workspace 명이 "ruler"(가설 A) 인지 "Button WOL"(가설 B) 인지
+
+**다음 의도**:
+- 사용자 브라우저 확인 결과 받으면:
+  - 가설 A → handoff.sh 에 "새 세션 + 새 Claude 프로세스 스폰 + target repo cwd" 패턴 반영 (30-45분)
+  - 가설 B → 로컬 수정 불가 확정, Phase 2α skip + §7.1 DEFER 3건 Supervisor 직접 판단 + Phase 3 진입
+- 어느 쪽이든 이번 plan.md 의 refine 본문은 cloud 가 ruler 를 읽지 못하면 (가설 B) 받을 수 없음 → 로컬 경로로 fallback
+
+**동기화 필요**:
+- handoff.sh: 2026-04-18 Ctrl+L pre-send fix 적용 완료 (promotion-log KNOWLEDGE 엔트리). 추가로 가설 A 확인 시 세션 스폰 로직 확장 필요
+- `ruler-ul-test` 세션: 검증 완료 후 `psmux kill-session -t ruler-ul-test` 로 정리 대상
+- plan.md §7.1 DEFER 3건 Supervisor 선판단 (가설 B 경우 반영):
+  - Q1 Python 제거: ✅ Cost 권고 (bash+jq 통합)
+  - Q2 Phase A 4주 유예: ⚠️ 절충안 (구현 + 관찰 전용 4주)
+  - Q3 R1~R11: ✅ (a) Cost 축소안 (부록 + BAD 시 보조 1줄)
+- 원래 `btn-ruler` 세션의 interrupted /ultraplan (session_01Xp97JSt3MsbGEisXEAHG6d) 은 방치 — 브라우저에서 탭 닫기만 하면 cleanup
