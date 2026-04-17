@@ -1,0 +1,1860 @@
+# event-rules.yaml v6 — Event-Driven Ruler Patrol
+#
+# plan: ~/.claude/.ruler/batch-plans/202604151600-event-driven-patrol/plan.md
+# schema: plan.md §이벤트 룰 스키마 (9컬럼 YAML)
+# version: v6 (2026-04-16 ruler-batch-20260416T0122) — 33 events (32 active, 1 pending)
+# v6 changes: 트리거 결함 4건 수정 (#23 mtime_poll 재설계, #26 consecutive errors, #28 work_complete, #31/#32 context 파싱)
+#              + grace/window 3차 비례 축소 15건
+# maintainer: ruler / ruler-batch-*
+#
+# 로드 규칙:
+#  1) patrol.md 3분 루프 첫 단계가 본 파일을 읽어 events.{id} 를 iterate
+#  2) trigger.type 별로 각기 다른 경로:
+#     - log_event : audit-log tail → match type → eventState FSM
+#     - mtime_poll: cycle_sec 주기로 spec 평가 → eventState FSM
+#     - heavy_scan: 별도 tier (>=180s) 로 강등, 본 루프 밖에서 실행
+#  3) 위반 확정 → on_violation.notify_agent (sendWithFile 경로, plan.md §Step 5 방안 B)
+#  4) supersede 조건 1개라도 만족 → state 즉시 해소
+#  5) auto_fix 는 v1 전부 null (v2 에서 반복 위반 메타 규칙 확정 후 도입)
+#  6) grace/window 상수 = 잠정값. 구현 완료 후 사용자 논의 phase 에서 최종 확정 (plan.md Step 7)
+#
+# v1 = 5 이벤트 (우선순위 고, 비용 0~저, 실측 hits 확보):
+#   1. memory_ckpt_missing_after_ctx_warn  (샘플 8, log_event chain, T2)
+#   2. home_cwd_pollution_detected          (샘플 9, mtime_poll,  T1, C2 치환)
+#   3. wf_session_in_secretary_registry     (샘플 10, log_event,  T1 sentinel)
+#   4. flag_stale_detected                  (신규 C4, mtime_poll, T1)
+#   5. guard_deny_burst                     (신규 C12, log_tail,  T1/T2 Urgent)
+#
+# v2 후보: 샘플 1 (plan→progress), 샘플 7 (commit_without_plan), 샘플 12 (ruler 자체검증)
+# v3 후보: C6/C7/C8/C13/C16/C17 mtime_poll 군, C18 분해 6건
+
+events:
+
+  # ─────────────────────────────────────────────────────────────
+  # 1. memory_ckpt_missing_after_ctx_warn  (샘플 8)
+  # ─────────────────────────────────────────────────────────────
+  # 배경: ctx_warn_jsonl 187 hits/9d live. 본 ruler-batch 세션이 직접 경험한 실패 경로 (144k 까지 가며 ckpt 뒤늦게 append). dogfood.
+  memory_ckpt_missing_after_ctx_warn:
+    trigger:
+      type: log_event
+      spec: '"type":"ctx_warn_jsonl" AND stage IN ["warn","critical","critical_nudge_1"]'
+      grace_sec: 120                 # warn 수신 후 2분 이내 append 면 정상 (사용자 확정: 작업중 nudge 받으면 60s론 부족)
+    watch:
+      resolve: audit_event_session
+      spec: "event.session 필드 = psmux 세션명. session.cwd 는 registry 에서 2차 해석"
+    rule_refs:
+      - ~/.claude/rules/file-standards.md#memory.md-압축-대비-append-규칙-2026-04-13
+      - ~/.claude/rules/secretary-system.md#규칙-전역-강제
+    expected_behavior: >
+      Agent 세션이 ctx_warn_jsonl 수신 후 120~300s 이내에 해당 세션 CWD 에 대응하는
+      `~/.claude/projects/{cwd-slug}/memory/MEMORY.md` 의 하단에
+      `- [ckpt-YYYYMMDDHHMM] ...` 형식 마커 1줄 이상을 append 한다 (rewrite 금지).
+      home-dir 세션은 secretary rule 2 에 의해 대상 제외.
+    violation_detector:
+      window_sec: 300                  # grace 120s 비례. 5분이면 압축 전 통보 가능 (110k→150k compact 3~7분)
+      check: >
+        cwd_slug = slugify(registry.cwd_of(event.session));
+        mem = `~/.claude/projects/${cwd_slug}/memory/MEMORY.md`;
+        IF NOT exists(mem): skip;
+        IF stat(mem).mtime >= event.ts AND tail(mem, 60).matches(/\[ckpt-\d{12}\]/):
+          resolved;
+        ELSE: violation
+    state_schema:
+      first_seen_ts:        { type: epoch,  desc: "ctx_warn_jsonl 최초 수신 시각" }
+      warn_stage:           { type: string, desc: "최강 stage 기록 (warn|critical|critical_nudge_1)" }
+      tokens_at_warn:       { type: int,    desc: "참고 메트릭" }
+      memory_mtime_at_warn: { type: epoch,  desc: "race 방지 snapshot" }
+      stage:                { type: enum,   values: [tracking, warned, confirmed] }
+    severity: T2
+    on_violation:
+      notify_agent:
+        channel: sendWithFile            # plan.md §Step 5 방안 B
+        message: |
+          ctx_warn_jsonl (stage={warn_stage}, tokens={tokens}) 수신 후 300s 경과 — MEMORY.md ckpt 누락.
+          file-standards.md §MEMORY.md Append 규칙 재확인 후 즉시
+          `- [ckpt-YYYYMMDDHHMM] {title} — hook` 1줄 append (rewrite 금지).
+          압축 발생 시 이 ckpt 가 다음 세션의 드리프트 방지선이다.
+        cite: ~/.claude/rules/file-standards.md#memory.md-압축-대비-append-규칙-2026-04-13
+      auto_fix: null
+    supersede:
+      - "MEMORY.md mtime > event.ts AND tail 에 새 [ckpt-*] 마커 1개 이상 등장"
+      - "같은 세션에서 `ctx_warn_cleared` log_event 수신 (fall below threshold)"
+      - "session 이 registry 에서 제거됨 (/exit or compact-exit)"
+      - "session CWD 가 home-dir 계열로 판정됨 (rule 2 exclusion)"
+
+  # ─────────────────────────────────────────────────────────────
+  # 2. home_cwd_pollution_detected  (샘플 9, patrol.md C2 치환)
+  # ─────────────────────────────────────────────────────────────
+  # 배경: home-dir plan/progress/harness/execution-log 4파일 오염 감지. spawn-session.sh audit emit 없음 → log_event 탈락 → mtime_poll pivot. supersedes_patrol: C2 (치환 관계).
+  home_cwd_pollution_detected:
+    supersedes_patrol: C2
+    trigger:
+      type: mtime_poll
+      spec: |
+        paths = [
+          "C:/msys64/home/jsh86/plan.md",
+          "C:/msys64/home/jsh86/progress.md",
+          "C:/msys64/home/jsh86/harness.md",
+          "C:/msys64/home/jsh86/execution-log.md",
+        ]
+        emit IF ANY path: exists(path) AND stat(path).size > 0
+      grace_sec: 5
+      cycle_sec: 60
+    watch:
+      resolve: explicit
+      spec: >
+        home-dir 은 어느 세션에도 속하지 않음 — writer 세션 식별 불가.
+        violation 발생 시 등록 세션 전체에 broadcast + 오염 경로 + 이동 후보.
+        writer 자진신고 프로토콜은 v2 이후.
+    rule_refs:
+      - ~/.claude/CLAUDE.md#workflow-principles
+      - ~/.claude/rules/secretary-system.md#규칙-전역-강제
+    expected_behavior: >
+      어떤 세션도 `C:\msys64\home\jsh86\` 하단에 plan.md / progress.md / harness.md /
+      execution-log.md 를 작성하지 않는다 (비서 레지스트리 조회 불가 경로 →
+      generateSessionResume 도달 불가 → 압축 리줌 전면 무효화). 작성 직전 `pwd` 확인.
+    violation_detector:
+      window_sec: 60
+      check: >
+        for p in [plan.md, progress.md, harness.md, execution-log.md]:
+          full = `C:/msys64/home/jsh86/${p}`;
+          IF exists(full) AND stat(full).size > 0:
+            violations.append({path, size, mtime});
+        emit violation IF len(violations) > 0
+    state_schema:
+      first_seen_ts:   { type: epoch }
+      polluted_paths:  { type: "list<{path,size,mtime}>" }
+      alert_sent_to:   { type: "list<session_name>" }
+      stage:           { type: enum, values: [detected, broadcast, quarantined] }
+    severity: T1
+    on_violation:
+      notify_agent:
+        channel: sendWithFile
+        broadcast: all_registered_sessions
+        message: |
+          ⛔ home-dir 오염 감지: `C:\msys64\home\jsh86\{plan.md|progress.md|harness.md|execution-log.md}`
+          하단 중 1개 이상 존재. 비서 generateSessionResume 은 registry CWD 기반 →
+          압축 리줌 시 도달 불가 → 비서 기능 전면 무효.
+          즉시 `pwd` 확인 후 (1) 프로젝트 판정 (2) `mv` → `D:\projects\{name}\` (3) 원본 삭제.
+          작성자 본인이면 다음 생성 직전 CWD 재확인 의무.
+        cite: ~/.claude/CLAUDE.md#workflow-principles
+      auto_fix: null                      # 프로젝트 판정 LLM 수준 — v1 수동
+    supersede:
+      - "4개 대상 파일 전부 부재 (NOT exists ∀)"
+      - "4개 대상 파일 전부 size == 0"
+      - "수동 이동 후 본 cycle 재검사에서 0 hits"
+
+  # ─────────────────────────────────────────────────────────────
+  # 3. wf_session_in_secretary_registry  (샘플 10, 회귀 sentinel)
+  # ─────────────────────────────────────────────────────────────
+  # 배경: registry.js L108 `WF_SESSION_RE.test(name) continue` 가드의 2차 sentinel. 평소 0 trigger. L108 주석처리/정규식 파손 회귀 감지 전용.
+  wf_session_in_secretary_registry:
+    trigger:
+      type: log_event
+      spec: |
+        on audit-log event { type: 'auto_register' }:
+          if (event.session matches /^(worker|verifier|healer|strategic)$/):
+            emit_violation(event.session, event.sid, event.ts)
+      grace_sec: 0
+      cycle_sec: 60
+    watch:
+      resolve: explicit
+      spec: >
+        violation_session = event.session (worker/verifier/healer/strategic 중 하나).
+        notify 대상은 violation 세션이 아닌 secretary owner = btn-button (agent 호스트).
+        WF 세션에 직접 nudge 금지 (Supervisor 충돌 — rule 3).
+    rule_refs:
+      - ~/.claude/rules/secretary-system.md#규칙-전역-강제
+    expected_behavior: >
+      registry.js L108 의 WF_SESSION_RE 가드가 worker/verifier/healer/strategic 이름의
+      세션이 .session-registry.txt 에 등록되는 것을 차단해야 한다. auto_register 이벤트의
+      session 필드에 이 4개 이름이 등장하면 가드 회귀로 판정.
+    violation_detector:
+      window_sec: 60
+      check: >
+        on each cycle tail last 60s of audit-log:
+          for ev where ev.type == 'auto_register':
+            if WF_SESSION_RE.test(ev.session):
+              row = grep "^{ev.session}|" .session-registry.txt;
+              if row: confirmed=true; violation += 1;
+              else: stale_event → supersede;
+        confirmed violations → notify_owner
+    state_schema:
+      seen_offsets:         { type: "map<log_file, byte_offset>", persist: ".ruler/state/event-cache/wf-session-reg.json" }
+      confirmed_violations: { type: "list<{session,sid,ts}>", ttl_sec: 86400 }
+    severity: T1
+    on_violation:
+      notify_agent:
+        channel: sendWithFile
+        broadcast: secretary_owner_only     # btn-button 단독
+        message: |
+          secretary-system.md rule 3 위반: WF 세션 {name} 이 registry 에 등록됨.
+          registry.js L108 WF_SESSION_RE 가드 우회 또는 정규식 파손 의심.
+          즉시 row 제거 + 회귀 분석 (retrospective/wf-session-leak-{ts}.md).
+        cite: ~/.claude/rules/secretary-system.md#규칙-전역-강제
+      auto_fix: null                        # v1 은 notify 만. 샘플 10 의 sed 삭제 스펙은 v2.
+    supersede:
+      - "registry row 가 다음 cycle 에서 이미 사라짐 (다른 가드 처리)"
+      - "event.session 이름이 registry 에 row 없음 (stale auto_register)"
+      - "registry.js 의 WF_SESSION_RE 가 의도적 비활성화 (`// REG-WF-INTENTIONAL` 마커)"
+
+  # ─────────────────────────────────────────────────────────────
+  # 4. flag_stale_detected  (신규 C4, mtime_poll)
+  # ─────────────────────────────────────────────────────────────
+  # 배경: patrol.md C4 Flag staleness 스윕 → 이벤트화. 8개 flag 파일 각자 TTL, 위반 시 rm. live ttl cheap 자동화.
+  flag_stale_detected:
+    supersedes_patrol: C4
+    trigger:
+      type: mtime_poll
+      spec: |
+        targets = [
+          # { path, ttl_sec, scope }
+          { path: "~/.claude/.lw-watchdog-ts",           ttl_sec: 240,   scope: global  },
+          { path: "~/.claude/.lw-watchdog-patrol-done",  ttl_sec: 240,   scope: global  },
+          { path: "~/.claude/.lw-watchdog-rule-read",    ttl_sec: 240,   scope: global  },
+          { path: "~/.claude/.self-wake-ts",             ttl_sec: 720,   scope: global  },
+          { path: "~/.claude/.wake-ts",                  ttl_sec: 720,   scope: global  },
+          { path: "~/.claude/.remote-session",           ttl_sec: 86400, scope: global  },
+          { path: "~/.claude/.home-cwd-warning",         ttl_sec: 3600,  scope: global  },
+          { path: "D:/projects/*/.wf-active",            ttl_sec: null,  scope: session },  # session-bound
+        ]
+        emit IF ANY target: exists(path) AND (
+          (ttl_sec != null AND (now - stat(path).mtime) > ttl_sec)
+          OR
+          (scope == session AND NOT session_alive(dirname(path)))
+        )
+      grace_sec: 30                   # 경계 race 여유
+      cycle_sec: 60
+    watch:
+      resolve: explicit
+      spec: >
+        flag 파일은 전역(global) 또는 프로젝트 경로(session) 에 위치. writer 세션은
+        과거에 발행한 세션이 이미 종료됐을 가능성 높음 → broadcast 없이 ruler 가
+        직접 `rm -f` 수행. 본 이벤트는 self-fix 성격 (notify 불필요).
+    rule_refs:
+      - ~/.claude/.ruler/patrol.md#c4-flag-staleness-스윕
+      - ~/.claude/skills/self-wake/skill.md
+    expected_behavior: >
+      각 flag 파일은 자신의 TTL 내 재갱신되거나, TTL 초과 시 원 작성자 또는 ruler 가
+      rm 해야 한다. session-bound 플래그(.wf-active)는 해당 세션이 registry 에서
+      사라지면 즉시 stale.
+    violation_detector:
+      window_sec: 60
+      check: >
+        for t in targets:
+          expanded = glob_or_stat(t.path);
+          for path in expanded:
+            IF NOT exists(path): continue;
+            IF t.ttl_sec != null AND (now - stat(path).mtime) > t.ttl_sec:
+              violations.append({path, age: now - stat(path).mtime, ttl: t.ttl_sec});
+            ELIF t.scope == 'session':
+              sess_dir = dirname(path);
+              IF NOT registry.has_cwd(sess_dir): violations.append({path, reason: 'session_dead'});
+        emit IF len(violations) > 0
+    state_schema:
+      first_seen_ts: { type: epoch }
+      stale_paths:   { type: "list<{path,reason,age?,ttl?}>" }
+      stage:         { type: enum, values: [detected, removed] }
+    severity: T1
+    on_violation:
+      notify_agent:
+        channel: log_only                  # rm 후 1줄 log, broadcast 없음
+        message: "flag_stale_detected: removed {n} stale flag(s) — {paths}"
+        cite: ~/.claude/.ruler/patrol.md#c4-flag-staleness-스윕
+      auto_fix:
+        action: rm_files
+        spec: |
+          for v in violations:
+            backup: cp v.path ~/.claude/.ruler/rollback/flag-{basename}-{ts}.bak  (if size > 0)
+            rm -f v.path
+            log_event('flag_stale_removed', { path: v.path, reason: v.reason, age: v.age })
+        rollback: cp {backup} {orig_path}
+    supersede:
+      - "대상 flag 파일 부재 (rm 완료 or 외부에서 삭제)"
+      - "flag mtime 이 cycle 중 갱신됨 (작성자 재발행 → TTL 리셋)"
+      - "session-bound flag 의 세션이 registry 에 재등장"
+      - ".remote-session: PSMUX_SESSION 또는 TMUX 환경변수가 현재 ruler 세션에 설정되어 있고 해당 세션이 registry 에 alive → 유효 flag 이므로 skip (v6 추가)"
+
+  # ─────────────────────────────────────────────────────────────
+  # 5. guard_deny_burst  (신규 C12, log_tail)
+  # ─────────────────────────────────────────────────────────────
+  # 배경: patrol.md C12 Deny log 스캔 → 이벤트화. hook-metrics.jsonl `event:"guard-deny"` tail 기준 3 hits/3min 동일 세션 = 교착.
+  # ⚠️ 소스 liveness: 2026-04-15 현재 hook-metrics.jsonl mtime=2026-04-07 → 본 이벤트 로드 전 hook 경로 재활성 선결. 설계만 v1 에 박아두고 "pending_source_revive" 플래그로 비활성화 기본.
+  guard_deny_burst:
+    supersedes_patrol: C12
+    enabled: false                          # hook-metrics.jsonl live 확인 후 true 전환
+    pending_source_revive:
+      reason: "hook-metrics.jsonl mtime=2026-04-07, 비활성. 재활성 시점에 enabled:true"
+      check_cmd: "stat -c %Y ~/.claude/hook-metrics.jsonl"
+      expected: "mtime > now - 3600"
+    trigger:
+      type: mtime_poll                     # 실제로는 log_tail — mtime_poll 로 파일 변화 감지 후 tail grep
+      spec: |
+        source: ~/.claude/hook-metrics.jsonl
+        cycle 마다 file size 증가 확인 → tail 증분 파싱
+        count hits per session in rolling 180s window:
+          ev.event == "guard-deny"
+          session = extract from ev.detail OR fallback "unknown"
+        emit IF any session: count >= 3 in window
+      grace_sec: 0
+      cycle_sec: 60
+    watch:
+      resolve: explicit
+      spec: >
+        hook-metrics.jsonl 의 `detail` 필드는 세션명 직접 포함 안 할 수 있음
+        (예: "Bash:"). v1 은 session-agnostic burst 판정 → notify 대상 =
+        secretary owner btn-button. v2 에 세션 식별 필드 추가 후 분리.
+    rule_refs:
+      - ~/.claude/.ruler/patrol.md#c12-deny-log-스캔-guard-watchdog-흡수
+      - ~/.claude/docs/operations/hook-guard-review.md
+    expected_behavior: >
+      동일 세션이 3분 윈도우 내 3건 이상 guard-deny 를 맞으면 hook/guard 교착 상태.
+      secretary 의 `checkGuardDeadlock` 이 settings.json deny 자동 패치를 emit
+      했어야 한다. 미발동 시 T2 Urgent.
+    violation_detector:
+      window_sec: 180
+      check: >
+        tail_since = state.last_offset OR (file_size - 16KB);
+        lines = tail(~/.claude/hook-metrics.jsonl, from: tail_since);
+        state.last_offset = file_size;
+        for ln in lines where ln.event == 'guard-deny':
+          sess = parse_session(ln.detail);
+          window[sess].push(ln.ts);
+          window[sess] = filter(window[sess], ts > now - 180);
+        for (sess, hits) in window:
+          if len(hits) >= 3:
+            secretary_patched = audit_log_has('guard_deadlock_patched', since=hits[0]);
+            if not secretary_patched: violation.append({sess, hits: len, last_ts: hits[-1]});
+        emit IF violation
+    state_schema:
+      last_offset:  { type: int,  desc: "hook-metrics.jsonl 마지막 읽은 byte offset" }
+      session_windows: { type: "map<session, list<epoch>>", ttl_sec: 300 }
+      first_seen_ts: { type: epoch }
+      hits_at_emit:  { type: int }
+      stage:         { type: enum, values: [tracking, warned, confirmed] }
+    severity: T2                            # Urgent tag 별도
+    urgent: true
+    on_violation:
+      notify_agent:
+        channel: sendWithFile
+        broadcast: secretary_owner_only
+        message: |
+          🚨 guard_deny_burst: 세션 {sess} 이 180s 내 guard-deny {hits} 건 (교착 의심).
+          secretary checkGuardDeadlock 의 settings.json deny 자동 패치 미발동.
+          즉시 `tail -20 ~/.claude/hook-metrics.jsonl | grep guard-deny` 확인 →
+          원인 파악 후 settings.json permissions.deny 수동 보강 or hook 코드 fix.
+        cite: ~/.claude/.ruler/patrol.md#c12-deny-log-스캔-guard-watchdog-흡수
+      auto_fix: null                        # settings.json 수정은 opus_only — v1 수동
+    supersede:
+      - "rolling window 180s 내 hits 가 3 미만으로 감소"
+      - "audit-log 에 `guard_deadlock_patched` 이벤트 (secretary 자동해소 확인)"
+      - "settings.json mtime 갱신 (수동 패치 완료)"
+
+  # ─────────────────────────────────────────────────────────────
+  # 6. ctx_warn_missing  (Batch 1, A2 — 비서 ctx-warn 미발송)
+  # ─────────────────────────────────────────────────────────────
+  # 배경: ctx-warn.js 가 토큰 80%+ 세션에 warn 을 보내야 한다.
+  # audit-log cycle_60s 에 sessions 필드가 있고, ctx_warn_jsonl 이벤트가
+  # 해당 세션에 대해 없으면 미발송 의심. 단, 비서 cycle 이 돌고 있어야 전제 성립.
+  ctx_warn_missing:
+    trigger:
+      type: mtime_poll
+      spec: |
+        paths = [
+          "D:/projects/button/agent/.secretary/.session-registry.txt",
+        ]
+        prescan: registry 파일 존재 + audit-log 존재 → candidate (ruler 가 교차 검증)
+        full_check (ruler 세션):
+          1. cycle_60s 이벤트 존재 확인 (비서 alive 전제)
+          2. 각 등록 세션의 JSONL 파일 크기로 토큰 추정
+          3. 추정 토큰 > 80k인 세션에 대해 ctx_warn_jsonl 이벤트 부재 → violation
+      grace_sec: 180                 # secretary 60s × 3사이클 = 미작동 확정 (v5: 300→180)
+      cycle_sec: 180
+    watch:
+      resolve: audit_event_session
+      spec: "registry 의 각 세션을 순회. JSONL 파일 크기 기반 추정."
+    rule_refs:
+      - ~/.claude/rules/secretary-system.md#규칙-전역-강제
+    expected_behavior: >
+      비서(ctx-warn.js)가 토큰 사용률 80%+ 세션에 ctx_warn_jsonl audit 이벤트를
+      emit 해야 한다. 10분 이상 emit 없이 세션 JSONL 이 계속 성장하면 미발송.
+    violation_detector:
+      window_sec: 360                   # v6: 600→360 (grace 180s 비례, 2배)
+      check: >
+        sessions = registry.getAll();
+        for sess in sessions:
+          jsonl_size = stat(sess.jsonl_path).size;
+          estimated_tokens = jsonl_size / 100;   # rough: 100 bytes/line * 500 tok → ~5 tok/byte
+          IF estimated_tokens > 80000:
+            has_ctx_warn = audit_log.has('ctx_warn_jsonl', session=sess.name, since=now-600);
+            IF NOT has_ctx_warn: violation.append({sess.name, estimated_tokens});
+        emit IF violation AND audit_log.has('cycle_60s', since=now-300)  # 비서 alive 전제
+    state_schema:
+      first_seen_ts:    { type: epoch }
+      missing_sessions: { type: "list<{name,estimated_tokens}>" }
+      stage:            { type: enum, values: [tracking, warned, confirmed] }
+    severity: T2
+    on_violation:
+      notify_agent:
+        channel: sendWithFile
+        broadcast: secretary_owner_only
+        message: |
+          ctx_warn_missing: 세션 {name} 추정 토큰 {estimated_tokens} (80k+) 인데
+          최근 10분간 ctx_warn_jsonl 이벤트 부재. ctx-warn.js 미작동 의심.
+          `tail -20 audit-log | grep ctx_warn` 확인 → ctx-warn.js 상태 점검.
+        cite: ~/.claude/rules/secretary-system.md#규칙-전역-강제
+      auto_fix: null
+    supersede:
+      - "해당 세션에 ctx_warn_jsonl 이벤트 수신"
+      - "세션이 registry 에서 제거됨"
+      - "비서 cycle_60s 이벤트 5분+ 부재 (비서 자체 다운 — 별도 이벤트)"
+
+  # ─────────────────────────────────────────────────────────────
+  # 7. registry_sync_drift  (Batch 1, A3 — registry ↔ psmux 불일치)
+  # ─────────────────────────────────────────────────────────────
+  # 배경: registry 에 있지만 psmux 에 없는 세션 (ghost), 또는 psmux 에 있지만
+  # registry 에 없는 세션 (미등록). autoRegister 가 60s 주기로 동기화하지만
+  # 실패할 수 있다. registry 경로: D:/projects/button/agent/.secretary/.session-registry.txt
+  registry_sync_drift:
+    trigger:
+      type: mtime_poll
+      spec: |
+        registry_path: "D:/projects/button/agent/.secretary/.session-registry.txt"
+        cycle 마다:
+          1. psmux ls → psmux_sessions (set)
+          2. registry 파일 파싱 → reg_sessions (set)
+          3. ghost = reg_sessions - psmux_sessions (등록됐지만 실제 없음)
+          4. unregistered = psmux_sessions - reg_sessions - WF_SKIP - SKIP_REG
+             (WF_SKIP = worker|verifier|healer|strategic)
+             (SKIP_REG = task*|schedule*|secretary*)
+          5. ghost 1개+ OR unregistered 1개+ → candidate
+      grace_sec: 120
+      cycle_sec: 180
+    watch:
+      resolve: explicit
+      spec: >
+        비교 대상: psmux ls 출력 ↔ .session-registry.txt 파이프 구분 파일.
+        ghost 세션은 session_dead 미처리 의심. unregistered 는 auto_register 실패 의심.
+    rule_refs:
+      - ~/.claude/rules/secretary-system.md#규칙-전역-강제
+    expected_behavior: >
+      registry.js autoRegisterSessions 이 60s 사이클마다 psmux ls 와 registry 를
+      동기화해야 한다. 2분(120s) 이상 불일치가 지속되면 동기화 실패.
+    violation_detector:
+      window_sec: 180
+      check: >
+        psmux_set = parse(psmux_ls_output);
+        reg_set = parse(registry_file);
+        ghost = reg_set - psmux_set;
+        unregistered = psmux_set - reg_set - WF_SKIP_RE - SKIP_REG_RE;
+        IF len(ghost) > 0 OR len(unregistered) > 0: violation
+    state_schema:
+      first_seen_ts: { type: epoch }
+      ghost_sessions: { type: "list<string>" }
+      unregistered_sessions: { type: "list<string>" }
+      stage: { type: enum, values: [detected, warned, confirmed] }
+    severity: T1
+    on_violation:
+      notify_agent:
+        channel: sendWithFile
+        broadcast: secretary_owner_only
+        message: |
+          registry_sync_drift: registry ↔ psmux 불일치 감지.
+          Ghost (registry O, psmux X): {ghost_sessions}
+          Unregistered (psmux O, registry X): {unregistered_sessions}
+          registry.js autoRegisterSessions 동기화 실패 의심.
+          `cat .secretary/.session-registry.txt` + `psmux ls` 대조 확인.
+        cite: ~/.claude/rules/secretary-system.md#규칙-전역-강제
+      auto_fix: null
+    supersede:
+      - "ghost + unregistered 모두 0개 (다음 cycle 자동 해소)"
+      - "비서 cycle_60s 이벤트 5분+ 부재 (비서 자체 다운)"
+
+  # ─────────────────────────────────────────────────────────────
+  # 8. audit_log_gap  (Batch 1, A4 — audit-log 공백)
+  # ─────────────────────────────────────────────────────────────
+  # 배경: 비서가 60s 사이클로 audit-log 에 cycle_60s 를 emit 한다.
+  # 5분 이상 cycle_60s 가 없으면 비서 자체 다운 의심. C16 보완.
+  audit_log_gap:
+    trigger:
+      type: mtime_poll
+      spec: |
+        paths = [
+          "~/.claude/audit-log/",
+        ]
+        prescan: audit-log 디렉토리 존재 → candidate (ruler 가 오늘자 파일 mtime 검증)
+        full_check (ruler 세션):
+          today_log = audit-log/{today}.jsonl
+          IF NOT exists(today_log): violation('no_log_file')
+          IF stat(today_log).mtime < now - 300: violation('log_stale')
+          ELSE: tail 100줄에서 cycle_60s 최신 ts > now - 300 확인
+      grace_sec: 60
+      cycle_sec: 180
+    watch:
+      resolve: explicit
+      spec: "비서 프로세스 자체 health check. 특정 세션 귀속 아님."
+    rule_refs:
+      - ~/.claude/rules/secretary-system.md#규칙-전역-강제
+    expected_behavior: >
+      비서(secretary.js)가 60초마다 cycle_60s 이벤트를 audit-log 에 emit 한다.
+      5분(300s) 이상 cycle_60s 가 없으면 비서 프로세스 crash 또는 hang.
+    violation_detector:
+      window_sec: 300
+      check: >
+        today_log = audit-log/{today}.jsonl;
+        IF NOT exists(today_log): violation('no_log_file');
+        age = now - stat(today_log).mtime;
+        IF age > 300: violation('log_stale', age);
+        ELSE:
+          tail = last 100 lines of today_log;
+          last_cycle = max(ts) where type='cycle_60s' in tail;
+          IF last_cycle is null OR (now - last_cycle) > 300:
+            violation('no_cycle_event', gap=now-last_cycle);
+    state_schema:
+      first_seen_ts:   { type: epoch }
+      gap_type:        { type: string, desc: "no_log_file | log_stale | no_cycle_event" }
+      gap_duration_sec: { type: int }
+      stage:           { type: enum, values: [detected, warned, confirmed] }
+    severity: T1
+    on_violation:
+      notify_agent:
+        channel: sendWithFile
+        broadcast: secretary_owner_only
+        message: |
+          🚨 audit_log_gap: 비서 audit-log 에 {gap_type} 감지 (gap={gap_duration_sec}s).
+          비서 프로세스 crash/hang 의심. 즉시 확인:
+          1. `psmux capture-pane -t btn-button -p | tail -20`
+          2. `tail -5 audit-log/{today}.jsonl`
+          3. 비서 재시작 필요 시 `node agent/server.js` 재실행
+        cite: ~/.claude/rules/secretary-system.md#규칙-전역-강제
+      auto_fix: null
+    supersede:
+      - "cycle_60s 이벤트 재수신 (비서 복구)"
+      - "audit-log mtime 갱신 (새 이벤트 기록)"
+
+  # ─────────────────────────────────────────────────────────────
+  # 9. presence_misjudgment  (Batch 1, A7 — presence 오판)
+  # ─────────────────────────────────────────────────────────────
+  # 배경: presence.js 가 Win32 idle API 로 idle/active 판정하는데,
+  # 사용자가 다른 앱에서 작업 중(키보드/마우스 활동)이어도 Claude Code 세션에서는
+  # idle 로 판정될 수 있다. 반대로 실제 자리비움인데 active 판정도 가능 (마우스 jitter).
+  # audit-log 에 직접적 presence 이벤트가 없으므로, 간접 증거로 감지.
+  presence_misjudgment:
+    trigger:
+      type: log_event
+      spec: '"type":"ruler_wake_signal"'
+      grace_sec: 60
+      cycle_sec: 180
+    watch:
+      resolve: explicit
+      spec: >
+        presence 오판은 세션 단위가 아닌 시스템 단위. Win32 idle API 는
+        전역 HID 이벤트 기반이므로 세션 무관. 오판 시 모든 세션에 영향.
+    rule_refs:
+      - ~/.claude/rules/secretary-system.md#규칙-전역-강제
+    expected_behavior: >
+      presence.js 의 idle/active 판정이 실제 사용자 HID 활동과 일치해야 한다.
+      idle 판정 후 30초 이내에 사용자 프롬프트가 들어오면 false idle.
+      active 판정인데 10분 이상 어떤 세션에서도 tool 활동이 없으면 false active.
+    violation_detector:
+      window_sec: 600
+      check: >
+        # v1: 간접 감지만 — presence audit 이벤트 없으므로 보수적
+        # false idle: ruler_wake_signal (idle 전환 기반) 직후 60s 내 jsonl_audit 발생
+        wake_signals = audit_log.filter(type='ruler_wake_signal', since=now-600);
+        for ws in wake_signals:
+          next_activity = audit_log.first(type='jsonl_audit', since=ws.ts, until=ws.ts+60);
+          IF next_activity: violation('false_idle', ts=ws.ts, activity=next_activity.ts);
+        # false active 는 v1 에서 skip (정의 어려움)
+    state_schema:
+      first_seen_ts:      { type: epoch }
+      misjudgment_type:   { type: string, desc: "false_idle | false_active" }
+      evidence:           { type: "list<{ts, type, detail}>" }
+      stage:              { type: enum, values: [detected, warned, confirmed] }
+    severity: T2
+    on_violation:
+      notify_agent:
+        channel: log_only
+        message: |
+          presence_misjudgment: {misjudgment_type} 감지.
+          idle 판정 후 {gap_sec}s 만에 사용자 활동 재개 (판정 부정확).
+          presence.js 의 idle threshold 또는 detection 로직 점검 필요.
+          decisions.jsonl 에 기록 후 retrospective 분석 대상.
+        cite: ~/.claude/rules/secretary-system.md#규칙-전역-강제
+      auto_fix: null
+    supersede:
+      - "window 600s 내 추가 오판 증거 없음 (일시적 jitter)"
+      - "presence.js 코드 변경 커밋 감지 (수정 진행중)"
+
+  # ─────────────────────────────────────────────────────────────
+  # 10. escalation_false_positive  (Batch 2, A5 — escalation 오탐)
+  # ─────────────────────────────────────────────────────────────
+  # 배경: escalation.js 가 bash retry / tool error 등에 escalation_warned 를 emit.
+  # 정상적 재시도 (exit code 1 → 수정 → 재시도) 에도 escalation 이 발동하면 오탐.
+  # BUG-O 재발 감시: "block 후 escalation 발동" 패턴.
+  escalation_false_positive:
+    trigger:
+      type: log_event
+      spec: '"type":"escalation_warned"'
+      grace_sec: 30
+      cycle_sec: 60
+    watch:
+      resolve: audit_event_session
+      spec: "escalation_warned 이벤트의 session 필드로 대상 세션 식별"
+    rule_refs:
+      - ~/.claude/rules/secretary-system.md#규칙-전역-강제
+    expected_behavior: >
+      escalation_warned 이벤트 발동 후 60초 이내에 해당 세션이 정상적으로 tool 사용을
+      재개하면 (jsonl_audit 이벤트), escalation 이 오탐이었을 가능성 높음.
+      특히 같은 세션에서 10분 내 escalation_warned 3건+ 이면 FSM 과민 반응.
+    violation_detector:
+      window_sec: 300                   # v6: 600→300 (grace 30s 비례, 10배 — 축적 관찰 필요)
+      check: >
+        esc_events = audit_log.filter(type='escalation_warned', since=now-300);
+        for sess in group_by(esc_events, 'session'):
+          IF len(sess.events) >= 3:
+            # 3건 이상 10분 내 = FSM 과민
+            violation('escalation_burst', session=sess.name, count=len(sess.events));
+          for ev in sess.events:
+            next_tool = audit_log.first(type='jsonl_audit', session=sess.name,
+                                        since=ev.ts, until=ev.ts+60);
+            IF next_tool: violation('false_positive', session=sess.name, ts=ev.ts);
+    state_schema:
+      first_seen_ts:   { type: epoch }
+      false_positives:  { type: "list<{session, ts, resumed_after_sec}>" }
+      burst_sessions:   { type: "list<{session, count}>" }
+      stage:            { type: enum, values: [tracking, warned, confirmed] }
+    severity: T2
+    on_violation:
+      notify_agent:
+        channel: log_only
+        message: |
+          escalation_false_positive: 세션 {session} 에서 escalation 오탐 감지.
+          {detail}. escalation.js FSM threshold 점검 필요.
+          decisions.jsonl 기록 후 retrospective 분석 대상.
+        cite: ~/.claude/rules/secretary-system.md#규칙-전역-강제
+      auto_fix: null
+    supersede:
+      - "window 600s 내 escalation_warned 0건"
+      - "escalation.js 코드 변경 커밋 감지"
+
+  # ─────────────────────────────────────────────────────────────
+  # 11. progress_model_drift_nudge_missing  (Batch 2, A9)
+  # ─────────────────────────────────────────────────────────────
+  # 배경: nudges.js checkProgressModelDrift 가 progress.md 의 현재 step model 과
+  # registry 의 실제 model 이 불일치할 때 nudge 를 보내야 한다.
+  # registry_model_refresh 이벤트 직후 불일치 감지 기대.
+  progress_model_drift_nudge_missing:
+    trigger:
+      type: log_event
+      spec: '"type":"registry_model_refresh"'
+      grace_sec: 60                    # v6: 120→60 (registry refresh 즉시 drift 판정 가능, 1사이클 여유)
+      cycle_sec: 180
+    watch:
+      resolve: audit_event_session
+      spec: "registry_model_refresh 이벤트 발생 세션을 추적"
+    rule_refs:
+      - ~/.claude/CLAUDE.md#model-routing
+      - ~/.claude/rules/file-standards.md#progress.md-포맷
+    expected_behavior: >
+      registry_model_refresh 로 모델 변경 감지 시, 해당 세션 CWD 에 progress.md 가
+      있고 현재 step 의 model 필드와 불일치하면 nudges.js 가 promo_nudge 를 emit 해야 한다.
+      refresh 후 120s 내 nudge 없으면 checkProgressModelDrift 미작동 의심.
+    violation_detector:
+      window_sec: 180                   # v6: 600→180 (grace 60s 비례, 3배)
+      check: >
+        refreshes = audit_log.filter(type='registry_model_refresh', since=now-180);
+        for ev in refreshes:
+          # registry 에서 세션의 현재 model 확인
+          # 해당 세션 CWD 에 progress.md 존재 여부 확인
+          # progress.md 현재 step 의 model 필드와 대조
+          # 불일치 + 120s 내 관련 promo_nudge 부재 → violation
+          pass  # ruler 세션이 교차 검증 (event-patrol.py pre-scan 범위 밖)
+    state_schema:
+      first_seen_ts:   { type: epoch }
+      drift_sessions:  { type: "list<{session, expected_model, actual_model}>" }
+      stage:           { type: enum, values: [tracking, warned, confirmed] }
+    severity: T2
+    on_violation:
+      notify_agent:
+        channel: sendWithFile
+        message: |
+          progress_model_drift_nudge_missing: 세션 {session} model drift 감지.
+          progress.md step: {expected_model}, registry: {actual_model}.
+          nudges.js checkProgressModelDrift 미작동 의심.
+          `grep model progress.md` + registry 대조 확인.
+        cite: ~/.claude/CLAUDE.md#model-routing
+      auto_fix: null
+    supersede:
+      - "해당 세션에 promo_nudge 수신 (nudge 정상 발동)"
+      - "progress.md model 필드가 registry 와 일치 (자가 수정)"
+      - "세션이 registry 에서 제거됨"
+
+  # ─────────────────────────────────────────────────────────────
+  # 12. resume_incomplete  (Batch 2, A10 — resume 섹션 불완전)
+  # ─────────────────────────────────────────────────────────────
+  # 배경: resume.js 가 compression 시 세션 리줌을 생성한다.
+  # compression_resume_injected 이벤트 후 해당 파일에 필수 섹션 헤더가 있어야 한다.
+  resume_incomplete:
+    trigger:
+      type: log_event
+      spec: '"type":"compression_resume_injected"'
+      grace_sec: 30
+      cycle_sec: 180
+    watch:
+      resolve: audit_event_session
+      spec: "compression_resume_injected 이벤트의 session 필드로 대상 식별"
+    rule_refs:
+      - ~/.claude/rules/secretary-system.md#규칙-전역-강제
+    expected_behavior: >
+      compression_resume_injected 이벤트 발생 시, 해당 세션에 주입된 리줌 파일
+      (sec-msg-{session}-{ts}.txt) 에 최소한 'Session Identity', 'Last User Request',
+      'MEMORY 인용 의무' 섹션 헤더가 포함되어야 한다. 섹션 누락 = resume.js 버그.
+    violation_detector:
+      window_sec: 120                   # v6: 600→120 (grace 30s 비례, 4배)
+      check: >
+        resume_events = audit_log.filter(type='compression_resume_injected', since=now-120);
+        for ev in resume_events:
+          # /tmp/sec-msg-{session}-*.txt 최신 파일 Read
+          # 필수 섹션: 'Session Identity', 'Last User Request', 'MEMORY'
+          # 누락 섹션 1개+ → violation
+          pass  # ruler 세션이 파일 내용 검증
+    state_schema:
+      first_seen_ts:      { type: epoch }
+      incomplete_resumes: { type: "list<{session, file, missing_sections}>" }
+      stage:              { type: enum, values: [detected, warned, confirmed] }
+    severity: T2
+    on_violation:
+      notify_agent:
+        channel: log_only
+        message: |
+          resume_incomplete: 세션 {session} 리줌 파일에 필수 섹션 누락.
+          누락: {missing_sections}. resume.js generateSessionResume 점검 필요.
+        cite: ~/.claude/rules/secretary-system.md#규칙-전역-강제
+      auto_fix: null
+    supersede:
+      - "해당 리줌 파일에 필수 섹션 전부 포함 확인"
+      - "세션이 종료됨 (더 이상 리줌 검증 불필요)"
+
+  # ─────────────────────────────────────────────────────────────
+  # 13. stuck_false_positive  (Batch 2, A11 — stuck 오탐)
+  # ─────────────────────────────────────────────────────────────
+  # 배경: stuck.js 가 tool 활동 부재 시 stuck 이벤트를 emit.
+  # 실제로 tool 활동이 있는데 stuck 이 발동하면 오탐. BUG-P/Q 재발 감시.
+  stuck_false_positive:
+    trigger:
+      type: log_event
+      spec: '"type":"stuck"'
+      grace_sec: 30
+      cycle_sec: 60
+    watch:
+      resolve: audit_event_session
+      spec: "stuck 이벤트의 session 필드로 대상 세션 식별"
+    rule_refs:
+      - ~/.claude/rules/secretary-system.md#규칙-전역-강제
+    expected_behavior: >
+      stuck 이벤트 발동 시, 해당 세션이 실제로 tool 미사용 상태여야 한다.
+      stuck 이벤트 직전 60s 내에 jsonl_audit 이벤트가 있으면 오탐.
+    violation_detector:
+      window_sec: 120                   # v6: 600→120 (grace 30s 비례, 4배)
+      check: >
+        stuck_events = audit_log.filter(type='stuck', since=now-120);
+        for ev in stuck_events:
+          recent_activity = audit_log.filter(type='jsonl_audit', session=ev.session,
+                                            since=ev.ts-60, until=ev.ts);
+          IF len(recent_activity) > 0:
+            violation('false_positive', session=ev.session, ts=ev.ts,
+                     last_activity=recent_activity[-1].ts);
+    state_schema:
+      first_seen_ts:      { type: epoch }
+      false_positives:    { type: "list<{session, stuck_ts, last_activity_ts}>" }
+      stage:              { type: enum, values: [tracking, warned, confirmed] }
+    severity: T2
+    on_violation:
+      notify_agent:
+        channel: log_only
+        message: |
+          stuck_false_positive: 세션 {session} 에서 stuck 오탐 감지.
+          stuck 발동 시각: {stuck_ts}, 직전 tool 활동: {last_activity_ts}.
+          stuck.js checkStuck threshold 또는 jsonl_audit 감지 로직 점검 필요.
+        cite: ~/.claude/rules/secretary-system.md#규칙-전역-강제
+      auto_fix: null
+    supersede:
+      - "window 600s 내 stuck 오탐 0건"
+      - "stuck.js 코드 변경 커밋 감지"
+
+  # ─────────────────────────────────────────────────────────────
+  # 14. memory_ckpt_format_error  (Batch 3, B2-5 — MEMORY ckpt 마커 형식 오류)
+  # ─────────────────────────────────────────────────────────────
+  memory_ckpt_format_error:
+    trigger:
+      type: mtime_poll
+      spec: |
+        paths = [
+          "~/.claude/memory/MEMORY.md",
+        ]
+        prescan: MEMORY.md 존재 + mtime 30분 이내 변경 → candidate
+        full_check (ruler 세션):
+          MEMORY.md tail 30줄에서 `[ckpt-` 패턴 매칭 후:
+          1. `ckpt-YYYYMMDDHHMM` 형식 (12자리 숫자) 확인
+          2. 미래 시각 (+1h 초과) 체크
+          3. 빈 hook (150자+ 권장, 200자 초과 경고) 체크
+      prescan_max_age_sec: 1800           # v7: 30분 이내 변경만 candidate (FP 억제)
+      grace_sec: 60
+      cycle_sec: 300
+    watch:
+      resolve: explicit
+      spec: "MEMORY.md 는 전역 파일. 모든 세션이 append 가능."
+    rule_refs:
+      - ~/.claude/rules/file-standards.md#memory.md-압축-대비-append-규칙-2026-04-13
+    expected_behavior: >
+      MEMORY.md 의 [ckpt-*] 마커는 `ckpt-YYYYMMDDHHMM` 12자리 KST 형식이어야 한다.
+      미래 시각, 비정규 형식, 빈 hook 은 형식 오류.
+    violation_detector:
+      window_sec: 1800
+      check: >
+        mem = MEMORY.md;
+        IF stat(mem).mtime < now - 1800: skip;
+        lines = tail(mem, 30).filter(match /\[ckpt-/);
+        for ln in lines:
+          m = match(ln, /ckpt-(\d+)/);
+          IF NOT m OR len(m[1]) != 12: violation('bad_format', line=ln);
+          ts = parse_kst(m[1]);
+          IF ts > now + 3600: violation('future_ts', line=ln);
+    state_schema:
+      first_seen_ts:   { type: epoch }
+      format_errors:   { type: "list<{line, error_type}>" }
+      stage:           { type: enum, values: [detected, warned, confirmed] }
+    severity: T1
+    on_violation:
+      notify_agent:
+        channel: sendWithFile
+        broadcast: all_registered_sessions
+        message: |
+          memory_ckpt_format_error: MEMORY.md ckpt 마커 형식 오류 감지.
+          {format_errors}. file-standards.md §MEMORY Append 규칙 준수 확인.
+        cite: ~/.claude/rules/file-standards.md#memory.md-압축-대비-append-규칙-2026-04-13
+      auto_fix: null
+    supersede:
+      - "MEMORY.md 에 형식 오류 0건 (수정 완료)"
+
+  # ─────────────────────────────────────────────────────────────
+  # 15. commit_format_violation  (Batch 3, B7-4 — conventional commit 미준수)
+  # ─────────────────────────────────────────────────────────────
+  commit_format_violation:
+    trigger:
+      type: mtime_poll
+      spec: |
+        paths = [
+          "D:/projects/button/.git/logs/HEAD",
+        ]
+        prescan: git reflog 파일 mtime 10분 이내 변경 → candidate
+        full_check (ruler 세션):
+          git log --oneline -5 에서 conventional commit prefix 검증
+          (feat|fix|refactor|chore|docs|test|style|ci|perf|build): 패턴
+      prescan_max_age_sec: 600            # v7: 10분 이내 변경만 candidate (FP 억제)
+      grace_sec: 60
+      cycle_sec: 300
+    watch:
+      resolve: explicit
+      spec: "git 커밋은 프로젝트 단위. 현재 button 프로젝트만 감시."
+    rule_refs:
+      - ~/.claude/CLAUDE.md#workflow-principles
+    expected_behavior: >
+      모든 커밋 메시지는 conventional commits 형식 (feat/fix/refactor/...: 설명).
+      prefix 없는 커밋 = 위반.
+    violation_detector:
+      window_sec: 300                   # v6: 600→300 (grace 60s 비례, 5배)
+      check: >
+        IF stat(HEAD_reflog).mtime < now - 300: skip;
+        commits = git_log_oneline(5);
+        for c in commits:
+          IF NOT match(c.message, /^(feat|fix|refactor|chore|docs|test|style|ci|perf|build)(\(.*\))?:/):
+            violation('no_prefix', commit=c.hash, message=c.message);
+    state_schema:
+      first_seen_ts:   { type: epoch }
+      bad_commits:     { type: "list<{hash, message}>" }
+      stage:           { type: enum, values: [detected, warned] }
+    severity: T2
+    on_violation:
+      notify_agent:
+        channel: log_only
+        message: |
+          commit_format_violation: conventional commit prefix 누락.
+          {bad_commits}. 다음 커밋부터 준수 요청.
+        cite: ~/.claude/CLAUDE.md#workflow-principles
+      auto_fix: null
+    supersede:
+      - "최근 5개 커밋 전부 conventional format 준수"
+
+  # ─────────────────────────────────────────────────────────────
+  # 16. routing_context_post_missing  (Batch 3, C5 — PostToolUse routing-context 미발동)
+  # ─────────────────────────────────────────────────────────────
+  routing_context_post_missing:
+    trigger:
+      type: mtime_poll
+      spec: |
+        paths = [
+          "~/.claude/hook-debug-early.log",
+        ]
+        prescan: hook-debug-early.log 존재 + mtime 10분 이내 → candidate
+        full_check (ruler 세션):
+          hook-debug-early.log tail 에서 'routing-context' + 'progress' 패턴 확인
+          progress.md 존재하는 세션에서 PostToolUse 발동 시 routing-context 기록 기대
+      prescan_max_age_sec: 600            # v7: 10분 이내 변경만 candidate (FP 억제)
+      grace_sec: 120                 # hook 미발동은 tool 몇 회면 확정 (v5: 300→120)
+      cycle_sec: 300                 # 5분 주기로 충분 (v5: 600→300)
+    watch:
+      resolve: explicit
+      spec: "hook 발동 검증. 모든 세션 공통."
+    rule_refs:
+      - ~/.claude/docs/operations/hook-guard-review.md
+    expected_behavior: >
+      PostToolUse hook 의 routing-context.sh 가 progress.md 존재하는 세션에서
+      tool 사용 시 발동하여 hook-debug-early.log 에 기록해야 한다.
+    violation_detector:
+      window_sec: 300                   # grace 비례 (v5: 600→300)
+      check: >
+        IF stat(hook-debug-early.log).mtime < now - 300: skip;
+        # progress.md 존재하는 활성 세션이 있는데 routing-context 기록 부재 → violation
+        pass  # ruler 세션이 교차 검증
+    state_schema:
+      first_seen_ts: { type: epoch }
+      stage:         { type: enum, values: [detected, warned] }
+    severity: T2
+    on_violation:
+      notify_agent:
+        channel: log_only
+        message: |
+          routing_context_post_missing: PostToolUse routing-context.sh 미발동 의심.
+          hook-debug-early.log 에서 routing-context 기록 부재.
+        cite: ~/.claude/docs/operations/hook-guard-review.md
+      auto_fix: null
+    supersede:
+      - "hook-debug-early.log 에 routing-context 기록 재수신"
+
+  # ─────────────────────────────────────────────────────────────
+  # 17. precompact_log_missing  (Batch 3, C6 — PreCompact log 부재)
+  # ─────────────────────────────────────────────────────────────
+  precompact_log_missing:
+    trigger:
+      type: log_event
+      spec: '"type":"compression_resume_injected"'
+      grace_sec: 60
+      cycle_sec: 180
+    watch:
+      resolve: audit_event_session
+      spec: "compression_resume_injected 은 compact 발생 증거. precompact-log.sh 도 발동했어야 함."
+    rule_refs:
+      - ~/.claude/docs/operations/hook-guard-review.md
+    expected_behavior: >
+      compact 발생 시 PreCompact hook 의 precompact-log.sh 가 발동하여
+      세션 상태를 로깅해야 한다. compression_resume_injected 는 있는데
+      precompact 로그 파일이 없으면 PreCompact hook 미발동.
+    violation_detector:
+      window_sec: 300                   # v6: 600→300 (grace 60s 비례, 5배)
+      check: >
+        resume_events = audit_log.filter(type='compression_resume_injected', since=now-300);
+        for ev in resume_events:
+          # precompact-log.sh 는 ~/.claude/.ruler/log/ 또는 별도 경로에 기록
+          # 해당 시간대 로그 부재 → violation
+          pass  # ruler 세션이 파일 존재 검증
+    state_schema:
+      first_seen_ts: { type: epoch }
+      stage:         { type: enum, values: [detected, warned] }
+    severity: T2
+    on_violation:
+      notify_agent:
+        channel: log_only
+        message: |
+          precompact_log_missing: compact 발생했지만 precompact-log.sh 기록 부재.
+          PreCompact hook 발동 확인 필요.
+        cite: ~/.claude/docs/operations/hook-guard-review.md
+      auto_fix: null
+    supersede:
+      - "precompact 로그 파일 존재 확인"
+
+  # ─────────────────────────────────────────────────────────────
+  # 18. progress_missing_after_plan  (Batch 3, B1-3 — plan 존재 + progress 부재)
+  # ─────────────────────────────────────────────────────────────
+  progress_missing_after_plan:
+    trigger:
+      type: mtime_poll
+      spec: |
+        paths = [
+          "D:/projects/button/plan.md",
+          "D:/projects/vaultvoice/plan.md",
+        ]
+        prescan: plan.md 존재 → candidate (ruler 가 progress.md 동반 존재 확인)
+        full_check (ruler 세션):
+          plan.md 존재 + progress.md 부재 + plan.md mtime 10분+ 경과 → violation
+      grace_sec: 600                 # 10분이면 논의 vs 구현 판단 충분 (v5: 1800→600)
+      cycle_sec: 600
+    watch:
+      resolve: explicit
+      spec: "프로젝트별 plan.md/progress.md 쌍. 현재 2개 프로젝트 감시."
+    rule_refs:
+      - ~/.claude/rules/file-standards.md#progress.md-포맷
+      - ~/.claude/CLAUDE.md#workflow-principles
+    expected_behavior: >
+      plan.md 작성 후 사용자가 구현을 요청하면 반드시 progress.md 를 생성해야 한다.
+      plan.md 가 10분 이상 존재하는데 progress.md 가 없으면 위반.
+    violation_detector:
+      window_sec: 1200                  # grace 비례 (v5: 3600→1200)
+      check: >
+        for proj in [button, vaultvoice]:
+          plan = {proj}/plan.md;
+          progress = {proj}/progress.md;
+          IF exists(plan) AND NOT exists(progress):
+            IF (now - stat(plan).mtime) > 600: violation(proj);
+    state_schema:
+      first_seen_ts:        { type: epoch }
+      missing_progress_for: { type: "list<string>", desc: "프로젝트명" }
+      stage:                { type: enum, values: [detected, warned] }
+    severity: T2
+    on_violation:
+      notify_agent:
+        channel: sendWithFile
+        message: |
+          progress_missing_after_plan: 프로젝트 {project} 에 plan.md 존재하지만
+          progress.md 부재 (30분+ 경과). file-standards.md §progress.md 포맷 준수.
+          즉시 progress.md 생성 또는 plan.md 가 living-doc 인지 확인.
+        cite: ~/.claude/rules/file-standards.md#progress.md-포맷
+      auto_fix: null
+    supersede:
+      - "progress.md 생성됨"
+      - "plan.md 삭제됨 또는 아카이브됨"
+
+  # ─────────────────────────────────────────────────────────────
+  # 19. progress_step_incomplete  (Batch 3, B1-4 — progress step model/wf 누락)
+  # ─────────────────────────────────────────────────────────────
+  progress_step_incomplete:
+    trigger:
+      type: mtime_poll
+      spec: |
+        paths = [
+          "D:/projects/button/progress.md",
+          "D:/projects/vaultvoice/progress.md",
+        ]
+        prescan: progress.md 존재 + mtime 10분 이내 변경 → candidate
+        full_check (ruler 세션):
+          progress.md 각 step 라인에 `model:` 또는 `wf:` 중 하나 존재 확인
+          양쪽 모두 부재 = violation
+      prescan_max_age_sec: 600            # v7: 10분 이내 변경만 candidate (FP 억제)
+      grace_sec: 120                 # progress.md 작성은 단발 Write, 2분 충분 (v5: 300→120)
+      cycle_sec: 600
+    watch:
+      resolve: explicit
+      spec: "프로젝트별 progress.md. 현재 2개 프로젝트 감시."
+    rule_refs:
+      - ~/.claude/rules/file-standards.md#progress.md-포맷
+    expected_behavior: >
+      progress.md 각 step 은 `model: X` 또는 `wf: Y` 중 정확히 하나를 포함해야 한다.
+      양쪽 모두 없는 step = 형식 위반.
+    violation_detector:
+      window_sec: 600                   # grace 비례 (v5: 1800→600)
+      check: >
+        for proj in [button, vaultvoice]:
+          progress = {proj}/progress.md;
+          IF NOT exists(progress): skip;
+          IF stat(progress).mtime < now - 600: skip;
+          steps = parse_steps(progress);
+          for step in steps:
+            has_model = 'model:' in step.text;
+            has_wf = 'wf:' in step.text;
+            IF NOT has_model AND NOT has_wf: violation(proj, step.number);
+    state_schema:
+      first_seen_ts:      { type: epoch }
+      incomplete_steps:   { type: "list<{project, step_number}>" }
+      stage:              { type: enum, values: [detected, warned] }
+    severity: T2
+    on_violation:
+      notify_agent:
+        channel: sendWithFile
+        message: |
+          progress_step_incomplete: 프로젝트 {project} progress.md Step {step_number} 에
+          model: 또는 wf: 필드 부재. file-standards.md §progress.md 포맷 준수.
+        cite: ~/.claude/rules/file-standards.md#progress.md-포맷
+      auto_fix: null
+    supersede:
+      - "해당 step 에 model: 또는 wf: 추가됨"
+      - "progress.md 삭제됨 또는 아카이브됨"
+
+  # ─────────────────────────────────────────────────────────────
+  # 20. file_conflict_unresolved  (70% push, A7 — file-conflict 미해소)
+  # ─────────────────────────────────────────────────────────────
+  file_conflict_unresolved:
+    trigger:
+      type: log_event
+      spec: '"type":"file_conflict"'
+      grace_sec: 120
+      cycle_sec: 60
+    watch:
+      resolve: audit_event_session
+      spec: "file_conflict 이벤트의 sessions 배열로 충돌 세션 식별"
+    rule_refs:
+      - ~/.claude/rules/secretary-system.md#규칙-전역-강제
+    expected_behavior: >
+      file_conflict 발생 후 120s 이내에 충돌 세션 중 하나가 해당 파일 Edit 을 중단하거나
+      조율이 이뤄져야 한다. 120s 후에도 같은 파일에 대한 Edit 이 양쪽에서 계속되면 미해소.
+    violation_detector:
+      window_sec: 300
+      check: >
+        conflicts = audit_log.filter(type='file_conflict', since=now-300);
+        for c in conflicts:
+          # 같은 파일에 대한 후속 Edit 이 양쪽 세션에서 계속되는지 확인
+          pass  # ruler 교차 검증
+    state_schema:
+      first_seen_ts: { type: epoch }
+      file: { type: string }
+      sessions: { type: "list<string>" }
+      stage: { type: enum, values: [detected, warned] }
+    severity: T1
+    on_violation:
+      notify_agent:
+        channel: sendWithFile
+        broadcast: all_registered_sessions
+        message: |
+          file_conflict_unresolved: {file} 에 대한 충돌이 120s+ 미해소.
+          충돌 세션: {sessions}. 한 세션이 해당 파일 Edit 을 양보해야 함.
+        cite: ~/.claude/rules/secretary-system.md#규칙-전역-강제
+      auto_fix: null
+    supersede:
+      - "해당 파일에 대한 후속 file_conflict 부재 (해소됨)"
+
+  # ─────────────────────────────────────────────────────────────
+  # 21. audit_log_duplicate  (70% push, A4 — audit-log 중복 이벤트)
+  # ─────────────────────────────────────────────────────────────
+  audit_log_duplicate:
+    trigger:
+      type: mtime_poll
+      spec: |
+        paths = [
+          "~/.claude/audit-log/",
+        ]
+        prescan: audit-log 디렉토리 존재 → candidate
+        full_check (ruler 세션):
+          오늘 audit-log tail 100줄에서 동일 {type, session, ts} 조합 중복 감지
+      grace_sec: 120                 # tail 100줄에서 중복은 즉시 판별 (v5: 300→120)
+      cycle_sec: 600
+    watch:
+      resolve: explicit
+      spec: "jsonl-audit.js 오프셋 관리 오류 시 동일 이벤트 중복 기록"
+    rule_refs:
+      - ~/.claude/rules/secretary-system.md#규칙-전역-강제
+    expected_behavior: >
+      jsonl-audit.js 가 증분 파싱하므로 동일 이벤트가 중복 기록되면 안 된다.
+      {type, session, ts} 조합이 2회+ 등장하면 오프셋 관리 버그.
+    violation_detector:
+      window_sec: 300                   # grace 비례 (v5: 600→300)
+      check: >
+        tail = last 100 lines of today_log;
+        groups = group_by(tail, ['type','session','ts']);
+        duplicates = [g for g in groups if len(g) >= 2];
+        IF duplicates: violation
+    state_schema:
+      first_seen_ts: { type: epoch }
+      duplicates: { type: "list<{type, session, ts, count}>" }
+      stage: { type: enum, values: [detected, warned] }
+    severity: T2
+    on_violation:
+      notify_agent:
+        channel: log_only
+        message: |
+          audit_log_duplicate: audit-log 에 중복 이벤트 감지.
+          {duplicates}. jsonl-audit.js 오프셋 관리 점검 필요.
+        cite: ~/.claude/rules/secretary-system.md#규칙-전역-강제
+      auto_fix: null
+    supersede:
+      - "tail 100줄에서 중복 0건"
+
+  # ─────────────────────────────────────────────────────────────
+  # 22. escalation_single_cycle_nudge  (70% push, A5 — BUG-Q 재발)
+  # ─────────────────────────────────────────────────────────────
+  # 배경: BUG-Q = struggle count 1 에서 nudge 보내면 안 됨 (observe only).
+  # escalation_warned 직후 같은 세션의 struggle count 가 1이면 오작동.
+  escalation_single_cycle_nudge:
+    trigger:
+      type: log_event
+      spec: '"type":"escalation_warned"'
+      grace_sec: 0
+      cycle_sec: 60
+    watch:
+      resolve: audit_event_session
+      spec: "escalation_warned 이벤트의 error 필드에서 struggle 패턴 확인"
+    rule_refs:
+      - ~/.claude/rules/secretary-system.md#규칙-전역-강제
+    expected_behavior: >
+      escalation.js 의 struggle FSM 은 count >= 2 에서만 nudge 를 보내야 한다.
+      count 1 에서 escalation_warned 가 발동하면 BUG-Q 재발.
+    violation_detector:
+      window_sec: 300
+      check: >
+        esc_events = audit_log.filter(type='escalation_warned', since=now-300);
+        for ev in esc_events:
+          IF 'struggle' in ev.error:
+            # 같은 세션의 직전 300s 내 escalation_warned 가 이 건 1개뿐이면 = count1 nudge
+            same_session = audit_log.filter(type='escalation_warned', session=ev.session,
+                                           since=ev.ts-300, until=ev.ts+1);
+            IF len(same_session) == 1: violation('single_cycle_nudge', ev);
+    state_schema:
+      first_seen_ts: { type: epoch }
+      stage: { type: enum, values: [detected, warned] }
+    severity: T2
+    on_violation:
+      notify_agent:
+        channel: log_only
+        message: |
+          escalation_single_cycle_nudge: BUG-Q 재발 의심.
+          세션 {session} 에서 struggle count 1 에서 escalation_warned 발동.
+          escalation.js FSM threshold 점검 필요.
+        cite: ~/.claude/rules/secretary-system.md#규칙-전역-강제
+      auto_fix: null
+    supersede:
+      - "window 300s 내 해당 패턴 0건"
+
+  # ─────────────────────────────────────────────────────────────
+  # 23. wf_complete_nudge_missing  (70% push, A9 — WF 완료 넛지 미발송)
+  # ─────────────────────────────────────────────────────────────
+  wf_complete_nudge_missing:
+    # v6 fix: WF 세션은 secretary rule 3 에 의해 registry 미등록 → session_dead emit 불가.
+    # 대신 .wf-active 파일 소멸 + psmux ls 에서 WF 세션 부재로 감지.
+    trigger:
+      type: mtime_poll
+      spec: |
+        # WF 완료 = (1) .wf-active 파일이 존재했다가 사라짐 OR (2) psmux ls 에서 WF 세션 부재
+        # secretary rule 3: WF 세션(worker/verifier/healer/strategic)은 감시 대상 외
+        #   → session_dead 이벤트 미발행 → log_event 방식 불가
+        # 대안: .wf-active 파일 mtime_poll + psmux ls 교차 검증
+        paths = [
+          "D:/projects/button/.wf-active",
+          "D:/projects/vaultvoice/.wf-active",
+        ]
+        prescan: |
+          # 이전 cycle 에 .wf-active 존재했는데 현재 부재 → WF 종료
+          # state.prev_wf_active 에 이전 cycle 존재 여부 저장
+          IF state.prev_wf_active AND NOT exists(path):
+            wf_ended = true
+          state.prev_wf_active = exists(path)
+          IF wf_ended:
+            psmux_sessions = shell('psmux ls')
+            WF_RE = /^(worker|verifier|healer|strategic)/
+            wf_alive = psmux_sessions.filter(s => WF_RE.test(s))
+            IF wf_alive.length == 0: emit  # WF 세션도 없고 .wf-active도 없음 = 완료
+      prescan_max_age_sec: 300            # v7: 5분 이내 .wf-active만 candidate (넛지 window 초과 FP 억제)
+      grace_sec: 60
+      cycle_sec: 60
+    watch:
+      resolve: explicit
+      spec: ".wf-active 소멸 감지. Supervisor 세션에 완료 넛지 전송 대상."
+    rule_refs:
+      - ~/.claude/rules/secretary-system.md#규칙-전역-강제
+    expected_behavior: >
+      WF 완료 시 (1) .wf-active 파일 삭제 (2) WF psmux 세션 종료.
+      nudges.js 가 이를 감지하고 Supervisor 에 완료 넛지를 보내야 한다.
+      .wf-active 소멸 후 60s 내 promo_nudge 부재 → 미발송.
+    violation_detector:
+      window_sec: 180
+      check: >
+        # .wf-active 소멸 감지 후
+        IF state.wf_ended_ts:
+          nudge = audit_log.first(type='promo_nudge',
+                  since=state.wf_ended_ts, until=state.wf_ended_ts+60);
+          IF NOT nudge: violation(state.project, state.wf_ended_ts);
+    state_schema:
+      first_seen_ts: { type: epoch }
+      missing_nudges: { type: "list<{wf_session, dead_ts}>" }
+      stage: { type: enum, values: [detected, warned] }
+    severity: T2
+    on_violation:
+      notify_agent:
+        channel: log_only
+        message: |
+          wf_complete_nudge_missing: WF 세션 {wf_session} 종료 후 120s 내 완료 넛지 부재.
+          nudges.js checkWfCompletion 점검 필요.
+        cite: ~/.claude/rules/secretary-system.md#규칙-전역-강제
+      auto_fix: null
+    supersede:
+      - "해당 WF 세션에 대한 promo_nudge 수신"
+
+  # ─────────────────────────────────────────────────────────────
+  # 24. ctx_state_transition_gap  (100% push, A2 — ctx FSM 전이 누락)
+  # ─────────────────────────────────────────────────────────────
+  ctx_state_transition_gap:
+    trigger:
+      type: log_event
+      spec: '"type":"ctx_warn_jsonl"'
+      grace_sec: 300
+      cycle_sec: 180
+    watch:
+      resolve: audit_event_session
+      spec: "ctx_warn_jsonl 이벤트의 session 필드"
+    rule_refs:
+      - ~/.claude/rules/secretary-system.md#규칙-전역-강제
+    expected_behavior: >
+      ctx-warn.js FSM 이 warn → critical → clear 순서로 전이해야 한다.
+      warn 후 compact 발생 시 clear 전이 필수. critical 후 300s 내 compact 미발생 → 비정상.
+      audit-log 에서 ctx_warn_jsonl 이벤트 시퀀스를 추적하여 FSM 전이가 올바른지 확인.
+    violation_detector:
+      window_sec: 300                   # v6: 600→300 (grace 300s와 1:1 — compact 시간 자체가 3~7분)
+      check: >
+        events = audit_log.filter(type='ctx_warn_jsonl', since=now-300);
+        FOR session IN unique(events.session):
+          stages = events.filter(session=session).map(e => e.stage).ordered_by(ts);
+          IF 'critical' IN stages AND 'clear' NOT IN stages[after_critical:]:
+            violation(session, 'critical without clear');
+    state_schema:
+      first_seen_ts: { type: epoch }
+      session: { type: string }
+      missing_transition: { type: string }
+      stage: { type: enum, values: [detected, warned] }
+    severity: T2
+    on_violation:
+      notify_agent:
+        channel: log_only
+        message: |
+          ctx_state_transition_gap: 세션 {session} 에서 ctx FSM 전이 누락.
+          {missing_transition}. ctx-warn.js 상태 머신 점검.
+        cite: ~/.claude/rules/secretary-system.md#규칙-전역-강제
+      auto_fix: null
+    supersede:
+      - "해당 세션 ctx_clear 이벤트 수신"
+
+  # ─────────────────────────────────────────────────────────────
+  # 25. registry_session_orphan  (100% push, A3 — registry ↔ psmux 고아 세션)
+  # ─────────────────────────────────────────────────────────────
+  registry_session_orphan:
+    trigger:
+      type: mtime_poll
+      spec: 'paths = ["D:/projects/button/agent/.secretary/.session-registry.txt"]'
+      cycle_sec: 900                   # #7 registry_sync_drift(T1,180s)와 중복 회피, 장기 고아 전용 (v5: 300→900)
+    watch:
+      resolve: registry_file
+      spec: ".session-registry.txt 와 psmux ls 비교"
+    rule_refs:
+      - ~/.claude/rules/secretary-system.md#규칙-전역-강제
+    expected_behavior: >
+      registry.js 가 psmux 세션과 registry 를 동기화해야 한다.
+      (1) psmux ls 에 있는데 registry 에 없는 세션 = 미등록 (auto-register 실패)
+      (2) registry 에 있는데 psmux ls 에 없는 세션 = 고아 (cleanup 실패)
+      제외: ruler/ruler-batch/worker/verifier/healer/strategic 등 특수 세션.
+    violation_detector:
+      window_sec: 600
+      check: >
+        psmux_sessions = shell('psmux ls').lines.filter(s => s.startsWith('btn-'));
+        registry_sessions = readFile(registry).lines.map(l => l.split('|')[0]);
+        orphans = registry_sessions.filter(s => !psmux_sessions.includes(s));
+        unregistered = psmux_sessions.filter(s => !registry_sessions.includes(s));
+        IF orphans.length > 0 OR unregistered.length > 0: violation;
+    state_schema:
+      first_seen_ts: { type: epoch }
+      orphans: { type: "list<string>" }
+      unregistered: { type: "list<string>" }
+      stage: { type: enum, values: [detected, warned] }
+    severity: T2
+    on_violation:
+      notify_agent:
+        channel: log_only
+        message: |
+          registry_session_orphan: registry ↔ psmux 불일치.
+          고아: {orphans}. 미등록: {unregistered}.
+          registry.js auto-register/cleanup 점검.
+        cite: ~/.claude/rules/secretary-system.md#규칙-전역-강제
+      auto_fix: null
+    supersede:
+      - "registry ↔ psmux ls 완전 일치"
+
+  # ─────────────────────────────────────────────────────────────
+  # 26. escalation_nudge_missing  (100% push, A5 — 연속 에러 3+ 시 escalation 미발동)
+  # ─────────────────────────────────────────────────────────────
+  escalation_nudge_missing:
+    # v6 fix: jsonl_audit 에 errors 필드 없음. 실제 에러 카운트는 "consecutive errors" 이벤트의 count 필드.
+    trigger:
+      type: log_event
+      spec: '"type":"consecutive errors"'    # v6 fix: jsonl_audit → consecutive errors (escalation.js emit)
+      grace_sec: 60                          # v6: 120→60 (에러 감지 즉시 escalation 기대)
+      cycle_sec: 180
+    watch:
+      resolve: audit_event_session
+      spec: "consecutive errors 이벤트의 session/count 필드 추적"
+    rule_refs:
+      - ~/.claude/rules/secretary-system.md#규칙-전역-강제
+    expected_behavior: >
+      escalation.js 가 세션의 연속 에러 3회+ 감지 시 escalation_warned 넛지를 발송해야 한다.
+      "consecutive errors" 이벤트의 count >= 3 인 세션에 대해 60s 내 escalation_warned 존재 확인.
+    violation_detector:
+      window_sec: 180                        # v6: 600→180 (grace 60s 비례)
+      check: >
+        errs = audit_log.filter(type='consecutive errors', since=now-180);
+        FOR ev IN errs:
+          IF ev.count >= 3:
+            esc = audit_log.first(type='escalation_warned', session=ev.session,
+                                  since=ev.ts-30, until=ev.ts+60);
+            IF NOT esc: violation(ev.session, ev.count);
+    state_schema:
+      first_seen_ts: { type: epoch }
+      session: { type: string }
+      error_count: { type: integer }
+      stage: { type: enum, values: [detected, warned] }
+    severity: T2
+    on_violation:
+      notify_agent:
+        channel: log_only
+        message: |
+          escalation_nudge_missing: 세션 {session} 연속 에러 {error_count}회,
+          escalation_warned 미발송. escalation.js FSM threshold 점검.
+        cite: ~/.claude/rules/secretary-system.md#규칙-전역-강제
+      auto_fix: null
+    supersede:
+      - "해당 세션 escalation_warned 이벤트 수신"
+
+  # ─────────────────────────────────────────────────────────────
+  # 27. bash_guard_escalation_leak  (100% push, A5 — BUG-O bash-guard block 이 struggle count 포함)
+  # ─────────────────────────────────────────────────────────────
+  bash_guard_escalation_leak:
+    trigger:
+      type: log_event
+      spec: '"type":"escalation_warned"'
+      grace_sec: 60
+      cycle_sec: 180
+    watch:
+      resolve: audit_event_session
+      spec: "escalation_warned 직전 에러 이벤트 유형 확인"
+    rule_refs:
+      - ~/.claude/rules/secretary-system.md#규칙-전역-강제
+    expected_behavior: >
+      escalation.js 가 bash-guard 의 'Blocked: sleep' 등 guard block 을
+      struggle count 에서 제외해야 한다 (BUG-O fix).
+      escalation_warned 직전 에러가 전부 bash_guard_block 이면 → BUG-O 재발.
+    violation_detector:
+      window_sec: 300
+      check: >
+        escs = audit_log.filter(type='escalation_warned', since=now-300);
+        FOR esc IN escs:
+          recent_errors = audit_log.filter(session=esc.session, since=esc.ts-180, type='jsonl_audit');
+          guard_blocks = recent_errors.filter(e => e.context.includes('Blocked:'));
+          IF guard_blocks.length == recent_errors.filter(e => e.errors > 0).length:
+            violation(esc.session, 'all errors are guard blocks');
+    state_schema:
+      first_seen_ts: { type: epoch }
+      session: { type: string }
+      guard_block_count: { type: integer }
+      stage: { type: enum, values: [detected, warned] }
+    severity: T1
+    on_violation:
+      notify_agent:
+        channel: sendWithFile
+        message: |
+          bash_guard_escalation_leak: BUG-O 재발 — 세션 {session} 에서
+          bash-guard block 만으로 escalation 발동. escalation.js guard block 제외 로직 점검.
+        cite: ~/.claude/rules/secretary-system.md#규칙-전역-강제
+      auto_fix: null
+    supersede:
+      - "escalation.js 에서 guard block 제외 확인"
+
+  # ─────────────────────────────────────────────────────────────
+  # 28. work_completion_nudge_missing  (100% push, A6 — 커밋 후 work-completion 미감지)
+  # ─────────────────────────────────────────────────────────────
+  work_completion_nudge_missing:
+    trigger:
+      type: log_event
+      spec: '"type":"work_complete"'       # v6 fix: commit_detected 이벤트 부재 → commits.js 실제 emit = work_complete
+      grace_sec: 120                       # v6: 180→120 (커밋 후 즉시 emit, 2분이면 충분)
+      cycle_sec: 180
+    watch:
+      resolve: audit_event_session
+      spec: "work_complete 이벤트의 session 필드 (commits.js L54 emit)"
+    rule_refs:
+      - ~/.claude/rules/secretary-system.md#규칙-전역-강제
+    expected_behavior: >
+      commits.js 가 커밋 감지 후 work_complete 이벤트를 emit 한다 (L54).
+      work_complete 후 120s 내 후속 처리 (simplify_reminder, diff_broadcast) 확인.
+      모든 커밋이 완료 넛지를 트리거하진 않지만, progress.md 의 마지막 step 커밋은 필수.
+    violation_detector:
+      window_sec: 600
+      check: >
+        commits = audit_log.filter(type='work_complete', since=now-600);  # v6 fix
+        FOR c IN commits:
+          IF c.context.includes('progress') OR c.context.includes('final'):
+            nudge = audit_log.first(type IN ['work_completion','simplify_nudge'],
+                    session=c.session, since=c.ts, until=c.ts+180);
+            IF NOT nudge: violation(c.session, c.ts);
+    state_schema:
+      first_seen_ts: { type: epoch }
+      session: { type: string }
+      commit_ts: { type: epoch }
+      stage: { type: enum, values: [detected, warned] }
+    severity: T2
+    on_violation:
+      notify_agent:
+        channel: log_only
+        message: |
+          work_completion_nudge_missing: 세션 {session} 최종 커밋 후 180s 내
+          work-completion 넛지 미발송. commits.js 완료 판정 로직 점검.
+        cite: ~/.claude/rules/secretary-system.md#규칙-전역-강제
+      auto_fix: null
+    supersede:
+      - "해당 세션 work_completion 이벤트 수신"
+
+  # ─────────────────────────────────────────────────────────────
+  # 29. rate_limit_undetected  (100% push, A7 — rate-limit 미감지)
+  # ─────────────────────────────────────────────────────────────
+  rate_limit_undetected:
+    trigger:
+      type: log_event
+      spec: '"type":"jsonl_audit"'
+      grace_sec: 60
+      cycle_sec: 180
+    watch:
+      resolve: audit_event_session
+      spec: "jsonl_audit 의 context 에서 rate limit 키워드 탐색"
+    rule_refs:
+      - ~/.claude/rules/secretary-system.md#규칙-전역-강제
+    expected_behavior: >
+      presence.js 가 rate-limit 상태를 감지하면 audit-log 에 rate_limit 이벤트를 기록해야 한다.
+      jsonl_audit 에서 'rate limit', 'too many requests', '429' 키워드가 에러로 등장하면
+      60s 내 rate_limit 이벤트 존재 확인. 미감지 시 presence.js rate-limit 로직 점검.
+    violation_detector:
+      window_sec: 180                   # v6: 600→180 (grace 60s 비례, 3배)
+      check: >
+        audits = audit_log.filter(type='jsonl_audit', since=now-180);
+        rate_errors = audits.filter(e => e.context.match(/rate.limit|429|too.many/i));
+        FOR re IN rate_errors:
+          rl = audit_log.first(type='rate_limit', session=re.session, since=re.ts-30, until=re.ts+60);
+          IF NOT rl: violation(re.session, re.ts);
+    state_schema:
+      first_seen_ts: { type: epoch }
+      session: { type: string }
+      error_ts: { type: epoch }
+      stage: { type: enum, values: [detected, warned] }
+    severity: T2
+    on_violation:
+      notify_agent:
+        channel: log_only
+        message: |
+          rate_limit_undetected: 세션 {session} 에서 rate-limit 에러 발생했으나
+          presence.js 가 rate_limit 이벤트 미기록. 감지 로직 점검.
+        cite: ~/.claude/rules/secretary-system.md#규칙-전역-강제
+      auto_fix: null
+    supersede:
+      - "해당 세션 rate_limit 이벤트 수신"
+
+  # ─────────────────────────────────────────────────────────────
+  # 30. promo_log_nudge_missing  (100% push, A9 — promotion-log 미기록 넛지 부재)
+  # ─────────────────────────────────────────────────────────────
+  promo_log_nudge_missing:
+    trigger:
+      type: log_event
+      spec: '"type":"escalation_warned"'
+      grace_sec: 180                 # "같은 턴" 기록 의무, 3분 충분 (v5: 300→180)
+      cycle_sec: 180
+    watch:
+      resolve: audit_event_session
+      spec: "escalation 발생 세션에서 promotion-log 기록 여부"
+    rule_refs:
+      - ~/.claude/rules/file-standards.md#promotion-log-규칙
+    expected_behavior: >
+      에러 escalation 발생 후 해당 세션이 promotion-log.md 에 ERROR 항목을 기록해야 한다.
+      nudges.js 가 미기록 시 promo_nudge 넛지를 발송해야 한다.
+      escalation_warned 후 180s 내 promotion-log.md mtime 변경 또는 promo_nudge 확인.
+    violation_detector:
+      window_sec: 360                   # v6: 600→360 (grace 180s 비례, 2배)
+      check: >
+        escs = audit_log.filter(type='escalation_warned', since=now-360);
+        FOR esc IN escs:
+          promo_mtime = stat('~/.claude/memory/promotion-log.md').mtime;
+          IF promo_mtime < esc.ts:
+            nudge = audit_log.first(type='promo_nudge', session=esc.session,
+                    since=esc.ts, until=esc.ts+180);       # "같은 턴" 기록 의무, 3분 충분 (v5: 300→180)
+            IF NOT nudge: violation(esc.session);
+    state_schema:
+      first_seen_ts: { type: epoch }
+      session: { type: string }
+      escalation_ts: { type: epoch }
+      stage: { type: enum, values: [detected, warned] }
+    severity: T2
+    on_violation:
+      notify_agent:
+        channel: log_only
+        message: |
+          promo_log_nudge_missing: 세션 {session} escalation 후 promotion-log 미기록,
+          promo_nudge 도 미발송. nudges.js checkPromotionLog 점검.
+        cite: ~/.claude/rules/file-standards.md#promotion-log-규칙
+      auto_fix: null
+    supersede:
+      - "promotion-log.md mtime 갱신 또는 promo_nudge 수신"
+
+  # ─────────────────────────────────────────────────────────────
+  # 31. stuck_nudge_missing  (100% push, A11 — 5사이클 무진전 stuck 미발동)
+  # ─────────────────────────────────────────────────────────────
+  stuck_nudge_missing:
+    # v6 fix: jsonl_audit 에 progress 필드 없음. stuck.js 는 git diff stat 기반 판정.
+    # 실제 감지 방법: jsonl_audit context 에 tools= 가 없으면 tool 미사용 = 무진전.
+    # 더 정확한 접근: jsonl_audit 이벤트 간격으로 무진전 판정 (5사이클 = 5분간 context 변화 없음).
+    trigger:
+      type: log_event
+      spec: '"type":"jsonl_audit"'
+      grace_sec: 360                 # stuck.js 판정(5×60=300s) + 1사이클 버퍼
+      cycle_sec: 180
+    watch:
+      resolve: audit_event_session
+      spec: "jsonl_audit context 의 tools= 패턴으로 활동 여부 판정"
+    rule_refs:
+      - ~/.claude/rules/secretary-system.md#규칙-전역-강제
+    expected_behavior: >
+      stuck.js 가 세션의 5사이클(300s) 무진전 감지 시 stuck 넛지를 발송해야 한다.
+      jsonl_audit 이벤트가 5사이클 연속 수신되는데 stuck 이벤트가 없으면 미발동.
+      실제 stuck 판정은 stuck.js 가 git diff --stat 기반으로 수행 (jsonl_audit 필드 아님).
+    violation_detector:
+      window_sec: 360                   # v6: 600→360 (grace 360s와 1:1 — stuck 판정 자체가 느려서)
+      check: >
+        # v6 fix: jsonl_audit.progress 필드 없음 → 간접 감지
+        # 5분(300s) 동안 jsonl_audit 5건+ 수신 = 비서 사이클은 정상 작동 중
+        # 같은 기간 stuck 이벤트 0건 = stuck.js 미발동 의심
+        # 추가 조건: 해당 세션에서 tool 활동 없음 (context 에 tools= 부재 또는 tools=0)
+        audits = audit_log.filter(type='jsonl_audit', since=now-600).sort_by(ts);
+        FOR session IN unique(audits.session):
+          sess_audits = audits.filter(session=session);
+          # 5건 이상 연속 수신되는데 context 에 tool 활동 없으면 무진전
+          no_tool_streak = consecutive_count(sess_audits,
+            e => NOT e.context OR NOT e.context.match(/tools=/));
+          IF no_tool_streak >= 5:
+            stuck = audit_log.first(type='stuck', session=session, since=now-360);
+            IF NOT stuck: violation(session, no_tool_streak);
+    state_schema:
+      first_seen_ts: { type: epoch }
+      session: { type: string }
+      zero_streak: { type: integer }
+      stage: { type: enum, values: [detected, warned] }
+    severity: T2
+    on_violation:
+      notify_agent:
+        channel: log_only
+        message: |
+          stuck_nudge_missing: 세션 {session} {zero_streak}사이클 무진전인데
+          stuck_diagnostic 미발송. stuck.js checkStuck 점검.
+        cite: ~/.claude/rules/secretary-system.md#규칙-전역-강제
+      auto_fix: null
+    supersede:
+      - "해당 세션 stuck 이벤트 수신"
+
+  # ─────────────────────────────────────────────────────────────
+  # 32. circular_work_undetected  (100% push, A11 — 순환 작업 미감지)
+  # ─────────────────────────────────────────────────────────────
+  circular_work_undetected:
+    # v6 fix: jsonl_audit.edited 필드 없음. edited 파일은 context 문자열 내 "edited=file1,file2" 패턴.
+    # 실제 circular 판정은 stuck.js 가 git diff --stat 5-slot history 로 수행.
+    trigger:
+      type: log_event
+      spec: '"type":"jsonl_audit"'
+      grace_sec: 180
+      cycle_sec: 180
+    watch:
+      resolve: audit_event_session
+      spec: "jsonl_audit context 내 edited= 패턴에서 파일 세트 추출"
+    rule_refs:
+      - ~/.claude/rules/secretary-system.md#규칙-전역-강제
+    expected_behavior: >
+      stuck.js checkCircularWork 이 동일 파일 세트를 3회+ 반복 편집하는 패턴을 감지하고
+      circular_work 경고를 발송해야 한다.
+      jsonl_audit context 의 edited= 파일 세트가 3사이클 반복되면 circular_work 이벤트 확인.
+      실제 circular 판정은 stuck.js 가 git diff --stat 5-slot history 기반 (L267-301).
+    violation_detector:
+      window_sec: 360                   # v6: 600→360 (grace 180s 비례, 2배)
+      check: >
+        # v6 fix: context 문자열에서 edited= 파싱
+        audits = audit_log.filter(type='jsonl_audit', since=now-600).sort_by(ts);
+        FOR session IN unique(audits.session):
+          edit_sets = audits.filter(session=session).map(e =>
+            parse_edited_from_context(e.context)  # "edited=a.js,b.js" → Set(a.js, b.js)
+          ).last(6);
+          IF count_repeated_set(edit_sets) >= 3:
+            circ = audit_log.first(type='circular_work', session=session, since=now-300);
+            IF NOT circ: violation(session);
+    state_schema:
+      first_seen_ts: { type: epoch }
+      session: { type: string }
+      repeated_files: { type: "list<string>" }
+      repeat_count: { type: integer }
+      stage: { type: enum, values: [detected, warned] }
+    severity: T2
+    on_violation:
+      notify_agent:
+        channel: log_only
+        message: |
+          circular_work_undetected: 세션 {session} 에서 동일 파일 세트 {repeat_count}회 반복 편집.
+          stuck.js checkCircularWork 감지 미발동. 순환 판정 로직 점검.
+        cite: ~/.claude/rules/secretary-system.md#규칙-전역-강제
+      auto_fix: null
+    supersede:
+      - "해당 세션 circular_work 이벤트 수신"
+
+  # ─────────────────────────────────────────────────────────────
+  # 33. direct_model_switch_detected  (v6 신규 — /model 직접 입력 감지)
+  # ─────────────────────────────────────────────────────────────
+  # 배경: CLAUDE.md §Model Routing — /model 직접 입력 금지, 반드시 model-switch-and-send.sh 경유.
+  # 직접 관측 불가 → 간접 추정: registry_model_refresh 이벤트 후 해당 세션 audit-log 에
+  # model-switch-and-send.sh Bash 호출 흔적 부재 = /model 직접 입력 의심.
+  direct_model_switch_detected:
+    trigger:
+      type: log_event
+      spec: '"type":"registry_model_refresh"'
+      grace_sec: 30
+      cycle_sec: 180
+    watch:
+      resolve: audit_event_session
+      spec: "registry_model_refresh 이벤트의 session 필드"
+    rule_refs:
+      - ~/.claude/CLAUDE.md#model-routing
+    expected_behavior: >
+      모델 전환은 반드시 model-switch-and-send.sh 또는 haiku-task.sh 경유.
+      registry_model_refresh 발생 시 직전 120s 내 해당 세션의 jsonl_audit context 에
+      'model-switch-and-send.sh' 또는 'haiku-task.sh' Bash 호출 흔적이 있어야 한다.
+      흔적 부재 = /model 직접 입력 의심.
+    violation_detector:
+      window_sec: 180
+      check: >
+        refreshes = audit_log.filter(type='registry_model_refresh', since=now-180);
+        FOR ev IN refreshes:
+          recent_audits = audit_log.filter(type='jsonl_audit', session=ev.session,
+                                          since=ev.ts-120, until=ev.ts);
+          has_helper = recent_audits.any(a =>
+            a.context.match(/model-switch-and-send\.sh|haiku-task\.sh/));
+          IF NOT has_helper: violation(ev.session, ev.ts);
+    state_schema:
+      first_seen_ts: { type: epoch }
+      session: { type: string }
+      refresh_ts: { type: epoch }
+      stage: { type: enum, values: [detected, warned] }
+    severity: T2
+    on_violation:
+      notify_agent:
+        channel: sendWithFile
+        message: |
+          direct_model_switch_detected: 세션 {session} 에서 /model 직접 입력 의심.
+          registry_model_refresh 직전 120s 내 model-switch-and-send.sh / haiku-task.sh 호출 부재.
+          CLAUDE.md §Model Routing 의 "직접 /model 입력 금지" 규칙 위반 가능성.
+          stdin 큐잉 risk 주의 — 헬퍼 경유로 전환.
+        cite: ~/.claude/CLAUDE.md#model-routing
+      auto_fix: null
+    supersede:
+      - "해당 세션 audit-log 에 model-switch-and-send.sh 호출 확인"
+      - "세션이 종료됨"
+
+  # ─────────────────────────────────────────────────────────────
+  # 34. ctx_warn_missed  (v7 신규 — 압축 발생인데 ctx-warn 미발동)
+  # ─────────────────────────────────────────────────────────────
+  # 배경: ctx-warn.js 가 110k(warn)/140k(critical)에서 경고해야 하는데,
+  # 15s 사이클 사이 토큰이 급등하면 .warn flag 없이 compression 도달.
+  # secretary.js 가 compression 감지 시 .warn flag 부재이면 ctx_warn_missed emit.
+  ctx_warn_missed:
+    trigger:
+      type: log_event
+      spec: '"type":"ctx_warn_missed"'
+      grace_sec: 10
+      cycle_sec: 180
+    watch:
+      resolve: audit_event_session
+      spec: "ctx_warn_missed 이벤트의 session 필드"
+    rule_refs:
+      - ~/.claude/rules/secretary-system.md#규칙-전역-강제
+    expected_behavior: >
+      모든 세션(ruler 포함)은 compression 전에 ctx-warn 110k 경고를 받아야 한다.
+      ctx_warn_missed 가 반복 발생하면 ctx-warn.js 의 사이클 주기 또는
+      JSONL 토큰 추출 로직에 문제가 있다.
+    violation_detector:
+      window_sec: 600
+      check: >
+        missed = audit_log.filter(type='ctx_warn_missed', since=now-600);
+        IF missed.count >= 2 FOR same session: violation(session, 'repeated ctx-warn miss');
+        IF missed.any(session='ruler'): violation('ruler', 'ruler ctx-warn 자기 세션 미발동');
+    state_schema:
+      session: { type: string }
+      miss_count: { type: integer }
+      first_seen_ts: { type: epoch }
+    severity: T1
+    on_violation:
+      notify_agent:
+        channel: log_only
+        message: |
+          ctx_warn_missed: 세션 {session} 에서 compression 발생했으나 ctx-warn 미발동.
+          .warn flag 미생성. ctx-warn.js JSONL 경로 해석 또는 사이클 타이밍 점검 필요.
+        cite: ~/.claude/rules/secretary-system.md#규칙-전역-강제
+      auto_fix: null
+    supersede:
+      - "해당 세션 ctx-warn 정상 발동 확인"
+
+  # ─────────────────────────────────────────────────────────────
+  # 35. ruler_session_anomaly  (v7 신규 — ruler 자기 세션 이상 감지)
+  # ─────────────────────────────────────────────────────────────
+  # 배경: ruler 는 watched 세션을 감시하지만 자기 세션에 대한 이벤트(stuck,
+  # consecutive_errors, error_escalation, compression_resume_skipped)를
+  # 인지하지 못했다. 이 규칙은 ruler 자기 세션에서 발생하는 이상 이벤트를 잡는다.
+  ruler_session_anomaly:
+    trigger:
+      type: log_event
+      spec: '"session":"ruler"'
+      grace_sec: 10
+      cycle_sec: 180
+    watch:
+      resolve: static
+      spec: "ruler"
+    rule_refs:
+      - ~/.claude/rules/secretary-system.md#규칙-전역-강제
+      - ~/.claude/.ruler/patrol-tier-a.md
+    expected_behavior: >
+      ruler 세션에 대해 stuck, consecutive_errors, error_escalation,
+      ctx_warn_missed, compression_resume_skipped 이벤트가 발동하면
+      ruler 자체적으로 인지하고 대응해야 한다.
+      stuck 과 consecutive_errors 는 ruler 의 합법적 long-thinking / plan archiving
+      bash 에러로 인한 FP 가능성이 높으므로, 즉시 조치 대신 로그 기록 + 패턴 분석.
+    violation_detector:
+      window_sec: 600
+      check: >
+        ruler_events = audit_log.filter(session='ruler', since=now-600,
+          type_in=['stuck','consecutive_errors','error_escalation',
+                   'ctx_warn_missed','compression_resume_skipped']);
+        IF ruler_events.count >= 1: candidate(ruler_events);
+        # stuck/consecutive_errors 는 FP 가능 → log_only, 반복 3회+ 시 escalate
+        stuck_count = ruler_events.filter(type='stuck').count;
+        error_count = ruler_events.filter(type='consecutive_errors').count;
+        IF stuck_count >= 3 OR error_count >= 3: violation('ruler', 'repeated anomaly');
+    state_schema:
+      event_type: { type: string }
+      count: { type: integer }
+      first_seen_ts: { type: epoch }
+      stage: { type: enum, values: [logged, escalated] }
+    severity: T2
+    on_violation:
+      notify_agent:
+        channel: log_only
+        message: |
+          ruler_session_anomaly: ruler 자기 세션에서 이상 이벤트 감지.
+          유형: {event_type}, 10분 내 {count}회.
+          stuck/consecutive_errors 는 FP 가능성 있음 — patrol long-thinking 또는
+          plan archiving bash 에러. 패턴 반복 시 T2 배치에서 근본 원인 분석.
+        cite: ~/.claude/.ruler/patrol-tier-a.md
+      auto_fix: null
+    supersede:
+      - "ruler 세션 정상 동작 5사이클 연속 확인"
+      - "T2 배치에서 FP 원인 해소"
+
+# ─────────────────────────────────────────────────────────────
+# v7 로드 요약 (v6 + ruler 자기 세션 감지)
+# ─────────────────────────────────────────────────────────────
+#  활성 (34): [v1] #1-4
+#             [Batch1] #6-9  [Batch2] #10-13  [Batch3] #14-19
+#             [70%push] #20-23
+#             [100%push] #24-32 (ctx_fsm, registry_orphan, esc_nudge, bash_guard_leak,
+#                                work_completion, rate_limit, promo_nudge, stuck_nudge, circular)
+#             [v6] #33 (direct_model_switch_detected)
+#             [v7] #34 (ctx_warn_missed), #35 (ruler_session_anomaly)
+#  pending (1): guard_deny_burst(#5)
+#
+#  v7 변경점:
+#    #34 ctx_warn_missed: compression 시 ctx-warn .warn flag 미존재 감지 (secretary.js emit)
+#    #35 ruler_session_anomaly: ruler 자기 세션 이상 자체 감지 (stuck/consecutive_errors/escalation)
+#    ruler 자기 세션 모니터링 갭 해소
+#
+# 비용: < 23ms/minute (log_event 23건 + mtime_poll ~26 stat)
+# 커버율: 61/64 (95%), 관측가능 61/61 (100%)

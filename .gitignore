@@ -1,0 +1,29 @@
+# Ruler 런타임 상태 (세션이 append/rewrite)
+.ruler/.cycle
+.ruler/.idle-strike
+.ruler/.last-patrol-ts
+.ruler/.last-classifier-review
+.ruler/.t2-locked-files
+.ruler/decisions.jsonl
+.ruler/event-patrol-feedback.jsonl
+.ruler/state.md
+.ruler/state-archive.md
+.ruler/state/
+.ruler/log/
+.ruler/snapshots/
+.ruler/pending/
+.ruler/rollback/
+.ruler/retrospective/
+.ruler/batch-plans/
+.ruler/.messages/
+.ruler/.plan-archive/
+.ruler/.blockers/
+
+# 백업 파일
+.ruler/*.bak-*
+
+# OS/IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
