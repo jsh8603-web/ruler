@@ -8,7 +8,7 @@ tags: [ruler, ssot, invariants, repo-root]
 
 이 폴더는 **규칙/문서/비서코드 자체의 정합성을 감시**하는 메타 레이어의 SSOT. 상위 계층(Supervisor/Worker/Secretary) 과 독립된 **장수명 세션 패트롤(Sonnet)** + **일회성 배치 세션(Opus)** 2-layer 구조.
 
-> **위치 전제**: `~/.claude/.ruler/` (`C:\Users\jsh86\.claude\.ruler\`). ruler 전용 git repo 분리는 **준비 중** — 분리된 뒤에도 이 CLAUDE.md 가 root 역할 유지.
+> **위치**: Repo 루트 = `D:\projects\ruler\` (remote: `github.com/jsh8603-web/ruler`). 규칙·스크립트는 `.ruler/` 하위, 원래 참조 경로 `~/.claude/.ruler/` 는 symlink 로 투과. 스킬 2개 (`skills/ruler-wf`, `skills/audit-wf`) 는 pre-commit hook sync. 구조 상세 → [`SYMLINK-SETUP.md`](./SYMLINK-SETUP.md).
 
 ---
 

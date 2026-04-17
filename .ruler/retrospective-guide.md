@@ -139,7 +139,7 @@ grep '"file":"<target>"' ~/.claude/.ruler/decisions.jsonl | tail -5
 
 **plan/progress/harness/execution-log 작성 시 경계**:
 - batch 세션은 `~/.claude/.ruler/batch-plans/{ts}-{slug}/plan.md + progress.md` 에만 작성
-- patrol 의 `.ruler/plan.md + .ruler/progress.md` **건드리지 않음** (주제 다름)
+- patrol 의 `D:\projects\ruler\plan.md + progress.md` (repo 루트) **건드리지 않음** (주제 다름)
 - button 레포 `plan.md + progress.md` **건드리지 않음** (batch 범위 밖)
 
 ---

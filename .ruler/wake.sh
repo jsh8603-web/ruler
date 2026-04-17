@@ -94,7 +94,7 @@ while true; do
   # .messages/wake-*.txt 감지 → .active touch + consume
   # 2026-04-14: 활성화 모델 재설계. 비서가 watched 세션의 WAITING→WORKING edge 를
   # 감지해 신호 파일을 drop 하면, 여기서 consume 하고 ruler patrol 을 재개한다.
-  # 근거: ~/.claude/.ruler/plan.md Step 2
+  # 근거: plan.md Step 2 (D:\projects\ruler\plan.md)
   _just_consumed=0
   shopt -s nullglob
   _signals=(.messages/wake-*.txt)
