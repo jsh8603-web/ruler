@@ -4,6 +4,8 @@
 .ruler/.last-patrol-ts
 .ruler/.last-classifier-review
 .ruler/.t2-locked-files
+.ruler/.wake-stop
+.ruler/.wf-active
 .ruler/decisions.jsonl
 .ruler/event-patrol-feedback.jsonl
 .ruler/state.md
