@@ -24,22 +24,47 @@ date: 2026-04-18
 - **권한 요건**: Windows 개발자 모드 ON (또는 관리자 CMD). 현재 개발자 모드 ON 상태로 생성됨
 - **검증**: `ls ~/.claude/.ruler` 와 `ls /d/projects/ruler/.ruler` 결과 동일 → 투과 OK
 
-## 3. 스킬 제외 사유 (중요)
+## 3. 스킬 파일 sync (옵션 C 적용)
 
-다음 2개는 **원래 경로 유지**, ruler 레포 추적 대상 아님:
-- `~/.claude/skills/ruler-wf/skill.md`
-- `~/.claude/skills/audit-wf/skill.md`
+다음 2개는 Obsidian G:\ 볼트 (Google Drive) 에 물리 존재. Google Drive 는 **reparse point 미지원** → symlink/junction 불가. **pre-commit hook 으로 G:\ → repo 단방향 sync** 적용.
 
-### 이유
-`~/.claude/skills/` = Windows junction → `G:\내 드라이브\obsidian_logan\00_Claude_Control\skills\` (Google Drive 볼트). Google Drive 가상 파일시스템은 **reparse point (symlink/junction) 미지원** — 하위에 symlink 생성 시도 시 "잘못된 파일 이름" 에러.
+- `G:\내 드라이브\obsidian_logan\00_Claude_Control\skills\ruler-wf\skill.md` (SSOT)
+- `G:\내 드라이브\obsidian_logan\00_Claude_Control\skills\audit-wf\skill.md` (SSOT)
 
-### 현재 정책 (옵션 A)
-스킬은 레포 밖, G:\ 에서 직접 편집. Google Drive 가 버전 히스토리 자체 관리. ultraplan refine 번들에는 포함되지 않음 — 룰러 계획의 스킬 편집 step 은 **수동 편집 필수**.
+### 구조
+```
+D:\projects\ruler\
+├── skills/
+│   ├── ruler-wf/skill.md      ← G:\ 에서 copy (mirror, 편집 금지)
+│   └── audit-wf/skill.md      ← G:\ 에서 copy (mirror, 편집 금지)
+├── scripts/
+│   └── sync-skills.sh         ← G:\ → repo 단방향 copy
+└── .git/hooks/
+    └── pre-commit             ← sync-skills.sh --stage 호출
+```
 
-### 향후 전환 가능 옵션
-- **B. 수동 copy 스냅샷**: `D:\projects\ruler\skills\` 에 1회 복사 후 드리프트 감수
-- **C. git hook 자동 sync**: pre-commit 에서 `cp G:\...\skill.md → D:\projects\ruler\skills\...` 강제
-- **D. skills junction 해체**: 비추 (~20 스킬 재매핑 필요)
+### sync 동작
+1. 편집자가 G:\ 의 skill.md 를 수정 (Obsidian 또는 직접)
+2. `git commit` 시 pre-commit hook 이 `sync-skills.sh --stage` 실행
+3. G:\ 와 repo 간 `cmp` 비교 → 차이 있으면 copy + `git add`
+4. 변경분이 커밋에 포함됨 → ultraplan refine 도 최신 skill 내용으로 번들링
+
+### 편집 규칙 (중요)
+- **G:\ = SSOT**. 편집은 반드시 G:\ 쪽에서 (Obsidian·직접편집·VaultVoice 어디든)
+- `D:\projects\ruler\skills\` 는 **mirror** 로 취급. 직접 편집 금지 (다음 sync 때 덮어써짐)
+- **ultraplan refine 이 repo 쪽 skill.md 를 수정한 경우**: 수동으로 `cp D:\projects\ruler\skills\{name}\skill.md G:\내 드라이브\...\skills\{name}\skill.md` → G:\ 에 반영 필수. 이 역방향은 자동화하지 않음 (Google Drive 파일 잠금·동기화 타이밍 이슈 회피)
+
+### 수동 실행
+```bash
+cd /d/projects/ruler && ./scripts/sync-skills.sh
+# 또는 스테이징까지:
+./scripts/sync-skills.sh --stage
+```
+
+### 기각된 대안
+- **A (제외)**: ultraplan 이 skill 내용을 못 봐서 refine·review 품질 저하 — 기각
+- **B (수동 copy)**: 편집자가 까먹으면 드리프트 — pre-commit hook 으로 강제 해결 (이것이 C)
+- **D (skills junction 해체)**: ~20 스킬 재매핑 부담 — 비추
 
 ## 4. 런타임 파일 (.gitignore)
 
@@ -101,5 +126,11 @@ cd /d/projects/ruler && git ls-files | wc -l
 - **2026-04-18 01:52 KST**: 초기 구성
   - `~/.claude/.ruler/*` 물리 이동 → `D:\projects\ruler\.ruler\*`
   - `mklink /D` 으로 원래 경로에 symlink 복원
-  - 스킬 2개는 G:\ Google Drive 제약으로 레포 스코프에서 제외
+  - 스킬 2개는 G:\ Google Drive 제약으로 레포 스코프에서 제외 (옵션 A 초안)
   - 초기 커밋 `3b55c70`
+
+- **2026-04-18 02:00 KST**: 옵션 C (pre-commit sync) 로 승격
+  - ultraplan 이 skill 내용을 못 봐서 refine·review 품질 저하 문제 식별
+  - `scripts/sync-skills.sh` 작성 (G:\ → repo 단방향 copy)
+  - `.git/hooks/pre-commit` 등록 → 커밋 시마다 자동 sync + 스테이징
+  - 초기 복사: `skills/ruler-wf/skill.md` (19k), `skills/audit-wf/skill.md` (12k)
