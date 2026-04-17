@@ -43,16 +43,36 @@ D:\projects\ruler\
     └── pre-commit             ← sync-skills.sh --stage 호출
 ```
 
-### sync 동작
-1. 편집자가 G:\ 의 skill.md 를 수정 (Obsidian 또는 직접)
-2. `git commit` 시 pre-commit hook 이 `sync-skills.sh --stage` 실행
-3. G:\ 와 repo 간 `cmp` 비교 → 차이 있으면 copy + `git add`
-4. 변경분이 커밋에 포함됨 → ultraplan refine 도 최신 skill 내용으로 번들링
+### sync 동작 (3-way 지능형)
+`sync-skills.sh` 는 `git HEAD` 를 기준점으로 G:\ / D:\ / HEAD 세 버전을 비교해 방향을 자동 결정:
 
-### 편집 규칙 (중요)
-- **G:\ = SSOT**. 편집은 반드시 G:\ 쪽에서 (Obsidian·직접편집·VaultVoice 어디든)
-- `D:\projects\ruler\skills\` 는 **mirror** 로 취급. 직접 편집 금지 (다음 sync 때 덮어써짐)
-- **ultraplan refine 이 repo 쪽 skill.md 를 수정한 경우**: 수동으로 `cp D:\projects\ruler\skills\{name}\skill.md G:\내 드라이브\...\skills\{name}\skill.md` → G:\ 에 반영 필수. 이 역방향은 자동화하지 않음 (Google Drive 파일 잠금·동기화 타이밍 이슈 회피)
+| G: vs HEAD | D: vs HEAD | 동작 |
+|---|---|---|
+| 일치 | 일치 | no-op |
+| 다름 | 일치 | **G: → D:** (외부 편집 흡수, 일반 케이스) |
+| 일치 | 다름 | **D: → G:** (ultraplan refine·에이전트 repo 편집 역전파) |
+| 다름 | 다름 | **ABORT** (양쪽 독립 편집 = 충돌, exit 2) |
+
+### 에이전트가 어떤 경로로 편집해도 안전
+| 편집 경로 | 실제 도달 | 커밋 시 동작 |
+|---|---|---|
+| `~/.claude/skills/ruler-wf/skill.md` | G:\ (junction) | G: → D: 자동 sync |
+| `D:\projects\ruler\skills\ruler-wf\skill.md` | D:\ | D: → G: **역전파** |
+| ultraplan refine 결과 | D:\ (repo 경로) | D: → G: **역전파** |
+| Obsidian 앱에서 편집 | G:\ | G: → D: 자동 sync |
+
+### 충돌 케이스
+두 쪽이 모두 마지막 커밋과 다르면 `sync-skills.sh` 가 exit 2 로 abort. 커밋도 차단됨. 수동 해결:
+```bash
+diff "/g/내 드라이브/obsidian_logan/00_Claude_Control/skills/ruler-wf/skill.md" \
+     "D:/projects/ruler/skills/ruler-wf/skill.md"
+# 채택할 쪽 결정 후 반대편에 cp, 다시 git commit
+```
+
+### 편집 규칙 (경로 무관하게 안전)
+- 어느 경로로 편집하든 `git commit` 시점에 pre-commit hook 이 정리
+- 단 **커밋 간격이 길수록 충돌 위험 증가** (양쪽에서 동시 편집 가능성) → 스킬 수정 후 가급적 빨리 커밋
+- hook 우회 (`git commit --no-verify`) 시 자동 sync 없음 → 수동으로 `./scripts/sync-skills.sh` 실행 필요
 
 ### 수동 실행
 ```bash
@@ -134,3 +154,9 @@ cd /d/projects/ruler && git ls-files | wc -l
   - `scripts/sync-skills.sh` 작성 (G:\ → repo 단방향 copy)
   - `.git/hooks/pre-commit` 등록 → 커밋 시마다 자동 sync + 스테이징
   - 초기 복사: `skills/ruler-wf/skill.md` (19k), `skills/audit-wf/skill.md` (12k)
+
+- **2026-04-18 02:10 KST**: 단방향 → 3-way 지능형 동기화로 재설계
+  - **결함 발견**: 단방향 (G: → D:) 은 D: 에서 편집 (ultraplan refine / agent 직접 편집) 시 다음 commit 에서 덮어써서 **편집 소실**
+  - `sync-skills.sh` 를 git HEAD 기준 3-way 판정으로 재작성
+  - 일반 케이스 G:→D: 외에 D:→G: 역전파 추가 + 충돌 시 abort
+  - 에이전트가 어떤 경로로 편집해도 안전 (`~/.claude/skills/...` 또는 `D:\projects\ruler\skills\...`)
