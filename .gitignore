@@ -6,6 +6,8 @@
 .ruler/.t2-locked-files
 .ruler/.wake-stop
 .ruler/.wf-active
+.ruler/.wake-pid
+.ruler/.wake-ts
 .ruler/decisions.jsonl
 .ruler/event-patrol-feedback.jsonl
 .ruler/state.md
