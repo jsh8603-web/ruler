@@ -1,6 +1,8 @@
 ---
 type: ruler-retrospective-guide
 date: 2026-04-15
+last-edit: 20260418-1432
+last-edit-by: btn-ruler (plan Step 1)
 tags: [ruler, retrospective, audit-wf, batch-ssot]
 ---
 
@@ -209,105 +211,152 @@ bash ~/.claude/.ruler/scripts/spawn-batch-session.sh "$PLAN_FILE"
 - 출력: 10개 소스를 단일 JSON 으로 정규화 (entries[] 배열)
 - Opus 는 이 JSON 하나만 읽으면 됨 (전역 Read 폭발 방지)
 
-## 검토 기준 R1~R11 (결정론적, Opus 판정 여지 최소화)
+## Phase A — T1/T2 Change-Impact Verdict [Primary]
 
-| # | 패턴 | 임계 | 판정 | 조치 |
-|---|---|---|---|---|
-| R1 | 동일 파일 T1 Edit | window 내 ≥3회 | **재수정 남용** | preflight 규칙: "이 파일 T1 경로 금지 → batch-only" |
-| R2 | retroactive_rollback | 1건+ | **Sonnet 오판 확정** | 해당 C-check 판정 모드 → batch-only 강등 + preflight |
-| R3 | 같은 체크 재발동 | T1 해결 후 동일 target 4 사이클 내 재출현 | **미완 수정** | Opus semantic 재분석 → 근본 원인 수정 큐잉 |
-| R4 | pending dropped 빈도 | window 내 ≥5건 stale drop | **pending 수명 초과** | N_stale 하향 or review 사이클 단축 |
-| R5 | 회귀 실패 | 1건+ | **인프라 취약** | opus_only_files 확장 + 해당 계열 batch-only |
-| R6 | rollback_rate >5% | 2 window 연속 | **구조적 Sonnet 부적합** | force_opus_fallback 자동 발동 |
-| R7 | same guard-deny | 서로 다른 세션 3회+ | **guard 규칙 자체 결함** | settings.json deny 룰 retrospective 격상 |
-| R8 | batch plan partial_failed | 1건+ | **의존성 그래프 결함** | Step 3 그룹 분해 재검토 |
-| R9 | preflight 매칭 0건 30일 | TTL 만료 | **규칙 사문화** | archive 이동 |
-| R10 | 규칙 충돌 | 같은 target 서로 다른 forbidden 2개+ | **규칙 모순** | Opus 우선순위 + 하나 retire |
-| R11 | 비서 미해결률 | ESCALATION / (WARN+SONNET) ≥ 0.5 (7d) | **elif 체인 부족** | `secretary.js` elif 확장 task + solution_cache 정리 |
+> **목적**: 각 T1/T2 수정이 실제로 에러를 줄였는지 / 재수정·회귀를 유발했는지 **인과 판정**. 단순 빈도 관찰 (구 R1~R11) 은 §부록 으로 이동 — Phase A Verdict 의 **보조 재료** 로 재배치.
 
-모든 판정은 **숫자 임계 기반**. Opus 역할은 (a) 규칙 문구 생성 (b) semantic reason 추론 (c) 규칙 간 의존성 정리.
+### 입력
 
-## 분석 쿼리
+- `decisions.jsonl` 7일치 T1/T2 entry (스키마: `ts/check/tier/file/outcome/phase`)
+- Δ 관찰 소스 (T 시점 전후 각 **3.5일** window, T-file 단위 분리):
+  - `decisions.jsonl` 동일 `check` + 동일 `file` 재발동 건수
+  - `retroactive_rollback` / `outcome:"rolled_back"` 발생
+  - `~/.claude/audit-log/{date}.jsonl` hook 실행 실패 / guard 차단 빈도
+  - `D:/projects/button/agent/.secretary/.secretary-state.json` + escalation 카운터
+
+### 처리 (per T1/T2 entry)
+
+1. T 시점 식별 (`ts` 필드)
+2. Pre-Δ (T-3.5d ~ T) 지표 snapshot
+3. Post-Δ (T ~ T+3.5d) 지표 snapshot
+4. 지표별 변화율 + 방향 판정
+
+### Verdict 스키마 (4등급)
+
+| Verdict | 기준 |
+|---|---|
+| **GOOD** | Post-Δ 에러/rollback ↓ 20%+ AND 신규 에러 0건 |
+| **NEUTRAL** | 변화 ±10% 이내 OR window 부족 (<3일) |
+| **BAD** | Post-Δ 에러/rollback ↑ 20%+ OR 같은 target 재수정 OR `retroactive_rollback` 발생 |
+| **INSUFFICIENT** | Pre-T window 내 해당 `check×file` 이벤트 **N < 10** (Poisson CI 하한 대신 단순 임계) OR Post window <3일 OR pre/post 3.5d 간격 미달 |
+
+**보조 판정 (BAD 확증)**: BAD 판정 직후 §부록 R1~R11 패턴 중 해당 `file/check` 매칭 건수가 pre window 대비 +50% 이상이면 BAD 확정 + `Δ summary` 칼럼에 **"R# pattern X hits"** 1줄 표기. 매칭 없으면 보조 표기 생략.
+
+**`original_absent:true` 예외**: Phase B Step 2 backfill 로 `original_absent:true` 가 붙은 entry 는 pre/post Δ 계산 불가 → **INSUFFICIENT 강제** (기록 누락 = 판정 누락 악순환 차단).
+
+### 출력 — `.ruler/retrospective/{YYYY-MM-DD}_change-impact.md`
+
+```markdown
+> ⚠️ OBSERVATION-ONLY MODE (until 2026-05-16)
+
+| T                    | file            | tier | action              | verdict | Δ summary                     |
+|----------------------|-----------------|------|---------------------|---------|-------------------------------|
+| 2026-04-18 01:21 KST | secretary.js    | T1   | WORKING_RE 재설계   | GOOD    | guard FP -70%, escalation -45%|
+| 2026-04-16 22:56 KST | t1-gate.sh      | T1   | delete 용도 오용    | BAD     | 같은 체크 3회 재발동 · R3 pattern 5 hits |
+```
+
+### BAD 판정 후속 (observation 해제 이후)
+
+- `.ruler/pending/revert-{ts}-{file}.md` 생성 — revert 또는 재검토 handoff
+- 다음 사이클 patrol 이 pending 처리 → Phase C (audit-wf 조건부) 큐잉 후보
+
+### Observation-Only 모드 (2026-04-18 ~ 2026-05-16, 4주)
+
+`.ruler/state.md` 의 `change_impact_enforcement_start: 2026-05-16` 필드가 **현재 date 이후** 인 동안:
+- verdict 산출 + md 기록 ✅
+- preflight 승격 ❌
+- `pending/revert-*.md` 생성 ❌
+- handoff 트리거 ❌
+- 출력 md 상단 배너: `> ⚠️ OBSERVATION-ONLY MODE (until 2026-05-16)`
+
+**해제 조건**: 2026-05-16 retrospective 에서 verdict 분포 검토 → INSUFFICIENT < 50% 시 state.md 필드 제거(=활성화). 이상이면 +2주 연장.
+
+### 구현 위치
+
+`.ruler/scripts/retrospective-collect.sh` 내 `compute_change_impact()` bash 함수 — `decisions.jsonl` + `audit-log/{date}.jsonl` 파싱 + jq/awk verdict 계산 + md 표 렌더링. (§progress.md Step 3)
+
+---
+
+## Phase B — §0.5 Compliance Audit + Patrol Sync [Secondary]
+
+> **목적**: §0.5 3단 기록 누락 감지 + patrol.md / event-rules.yaml / rules/*.md 의미 드리프트 동기화. "최근 7일 §0.5 누락 감사" 의 **단일 소유자** (Phase C audit-wf Phase Final-B 가 이 경계를 위임 명시).
+
+### Step 1 — 누락 감사
 
 ```bash
-# A. 재수정 패턴 — 동일 파일이 window 내 N회+ 수정
-tail -500 ~/.claude/.ruler/decisions.jsonl \
-  | jq -s '[.[] | select(.tier | test("T1|T2_batch_applied"))] | group_by(.file)[] | select(length>=3) | {file: .[0].file, count: length, cycles: [.[].cycle]}'
+# 1) 지난 7일 실제 변경 파일 (source of truth: mtime, 경로 정규화)
+find ~/.claude/rules ~/.claude/skills ~/.claude/docs ~/.claude/.ruler \
+     D:/projects/button/agent/secretary.js \
+     D:/projects/button/agent/secretary/*.js \
+     -type f -mtime -7 \
+  | xargs -I{} realpath "{}" 2>/dev/null \
+  | sort -u > /tmp/retro-actual.txt
 
-# B. 원복 이력
-tail -500 ~/.claude/.ruler/decisions.jsonl \
-  | jq -s '[.[] | select(.action=="retroactive_rollback" or .outcome=="rolled_back")]'
+# 2) decisions.jsonl 기록 file 목록 (경로 정규화)
+jq -r 'select(.ts > "2026-04-11") | .file // (.files[]? // empty)' \
+     ~/.claude/.ruler/decisions.jsonl \
+  | xargs -I{} realpath "{}" 2>/dev/null \
+  | sort -u > /tmp/retro-recorded.txt
 
-# C. 규칙 위반 근접
-tail -500 ~/.claude/.ruler/decisions.jsonl \
-  | jq -s '[.[] | {check, cycle}] | group_by(.check)[] | select(length>=5)'
+# 3) 차집합 + git log 교차검증 (NTFS mtime 오탐 방어)
+comm -23 /tmp/retro-actual.txt /tmp/retro-recorded.txt \
+  | while read f; do
+      # button repo 는 git log --since, .claude 는 mtime 신뢰
+      if [[ "$f" == /d/projects/button/* ]]; then
+        git -C D:/projects/button log --since=7.days --name-only --pretty=format: -- "$f" 2>/dev/null | grep -q . && echo "$f"
+      else
+        echo "$f"
+      fi
+    done > /tmp/retro-missing.txt
 ```
 
-## AI 판정 출력 — `.ruler/retrospective/{YYYY-MM-DD}_review.md`
+- **.gitignore/git ls-files 필터**: secretary.js 번들링 같은 build artifact 는 누락 후보에서 제외
+- **Symlink 정규화**: `~/.claude/.ruler/` ↔ `D:/projects/ruler/.ruler/` 경로 mismatch 는 realpath 로 통일
 
+### Step 2 — 누락 건별 backfill
+
+각 누락 파일마다:
+- `mtime` + `git log -p` (button) 으로 변경 시점/행위자/사유 추정
+- `decisions.jsonl` append — 필수 필드: `reason:"retrospective backfill"`, **`original_absent:true`**, tier 추정 (`T1`/`T2`/`unknown`), `meta: {inferred_from: "mtime|git_log"}`
+- `log/{date}.md` "누락 복구" 섹션 append
+
+**Phase A 재평가**: `original_absent:true` entry 는 위 Verdict 스키마에서 **INSUFFICIENT 강제** (pre/post Δ 계산 불가).
+
+### Step 3 — Patrol 규칙 동기화 (LLM 의미 비교, 범위 축소)
+
+**진입 조건**: Step 2 backfill 건 중 파일명이 `patrol*` / `event-rules*` / `rules/*.md` 연관인 경우만. (실측 기준: 누락 30건 중 patrol 연관 5-10건 예상 → LLM 호출 1/3-1/6 수준)
+
+**비교**: 변경된 규칙/코드 의미 vs `patrol.md` / `patrol-tier-*.md` / `event-rules.yaml` 감지 기준.
+
+**판정**:
+- **T1 즉시**: 정면 충돌 → patrol Edit + 별도 decisions.jsonl entry (`tier:"T1"`, `reason:"patrol drift sync"`)
+- **T2 pending**: drift 하지만 오탐만 → `pending/patrol-sync-{id}.md`
+- **clean**: 정합 유지
+
+**결정론성 메타**: LLM 호출 시 프롬프트 해시 + 응답 해시를 decisions.jsonl `meta: {prompt_hash, response_hash}` 에 기록. 3주 누적 후 같은 (파일, 규칙) 쌍에 대한 판정 일관성 메타 리포트.
+
+### 출력 — `.ruler/retrospective/{YYYY-MM-DD}_compliance.md`
+
+```markdown
+## 누락 감사
+- 실제 변경: N건
+- decisions.jsonl 기록: M건
+- 누락: K건 → backfill + patrol sync 수행
+  - original_absent:true → Phase A INSUFFICIENT K건
+
+## Patrol Drift (누락 건 대상, patrol*/event-rules*/rules/*.md 만)
+- T1 즉시 갱신: N건 ({파일:라인})
+- T2 pending: M건
+- clean: K건
 ```
+
 ---
-type: retrospective
-window: cycles 52-82 (30 사이클)
-generated_by: ruler-batch-{ts}
----
-## 재수정 패턴 분석
-- {file}: N회 수정, 원인={Opus semantic 추론}
-  → 교훈: "{이 파일은 이런 방향으로 수정하면 안 됨}"
 
-## 원복 이력
-- ...
+## Phase C — 심층 감사 연계 (audit-wf 조건부) [기존 Phase B 승격]
 
-## 추출 Pre-flight 규칙 (자동 승격)
-- rule_id: preflight-{seq}
-  target: {파일 경로 pattern}
-  forbidden_change: {구체 패턴}
-  reason: {근거}
-  registered_to: .ruler/preflight-rules.md
-```
+> **경계**: Phase B 가 "최근 7일 §0.5 누락" 단일 소유자 — Phase C 는 그 범위 밖 (장기 drift, 파일 리스트 추적, 인덱스 정합성, rollback 품질 저하) 만 다룬다. `~/.claude/skills/audit-wf/skill.md` Phase Final-B 가 이 경계를 명시적으로 위임한다 (progress.md Step 6).
 
-## Pre-flight 규칙 등록
-
-- `.ruler/preflight-rules.md` 신설. patrol.md 와 별도 SSOT — 자동 생성 규칙 전용.
-- `t1-gate.sh` 가 Edit 직전 매칭 검사. `forbidden_change` 패턴 등장 → T2 강제 + decisions.jsonl `gate:"preflight_block"`.
-- 규칙 TTL 30일. 매칭 0건이면 자동 만료 (`.ruler/preflight-rules.md/archive/`).
-- 규칙 충돌 감지: 같은 target 다른 forbidden 2개+ → 다음 batch task 자동 큐잉.
-
-## 3-Phase 파이프라인
-
-```
-(1) 소스 수집                  (2) 계획 (지도)                (3) 실행 (주행)
- retrospective-                retrospective-plan.md          ruler-batch-{ts}
- collect.sh --7d            →  (짧은 지도, 방향성만)        →  (patrol.md 규칙 Edit
- → /tmp/*.json                 ↓                                + preflight-rules.md append
-                               batch 세션 스폰                    + decisions.jsonl 기록)
-                               (ruler-batch-{ts}, opus)
-```
-
-### Phase 1 — 소스 수집
-`retrospective-collect.sh` 자동 실행. JSON 산출. 순찰 세션(Sonnet)이 조건 감지 시 트리거만.
-
-### Phase 2 — 계획 파일 생성 (`.ruler/retrospective/{YYYY-MM-DD}_plan.md`)
-
-**포맷 제약 (batch plan 과 동일)**: 코드 snippet 금지. `before/after` / `old_string`/`new_string` 금지. 전역 grep dump 금지.
-
-- ✅ **포함**: (a) 발동 조건 1줄 (b) 수집 소스 summary (건수만) (c) R1~R10 매칭 테이블 (d) **추출 방향성 규칙** (각 1~3줄 자연어) (e) 실행 step 계획
-- **예시/방향성 문장** — "이 파일은 A 방향 수정 금지" / "C12 가 재발하니 guard 재검토" 같은 방향성. 구현 구문 금지.
-- **사용자 3초 판단 창** — plan 1페이지 요약.
-
-### Phase 3 — Batch 세션 실행
-
-**Phase A (Retrospective)**:
-- `spawn-batch-session.sh <plan-file>` (opus 고정)
-- 초기 프롬프트: 헬퍼가 plan 파일 경로 자동 주입 (Read 지시 포함)
-- batch 세션이 plan 기반 Edit:
-  - patrol.md 규칙 섹션 보강 (C-check 판정 모드 변경, opus_only_files 확장)
-  - `.ruler/preflight-rules.md` 에 rule_id append
-  - TTL 만료 규칙 archive 이동
-
-**Phase B (Audit-WF 연계)** — Phase A 완료 후 같은 batch 세션이 audit-wf 절차 연속 실행.
-
-**Phase B 진입 조건 (결정론적, OR)**:
+### 진입 조건 (결정론적, OR)
 
 | # | 조건 | 측정 | 성격 |
 |---|---|---|---|
@@ -315,45 +364,137 @@ generated_by: ruler-batch-{ts}
 | B2 | 마지막 audit-wf 실행 ≥ 7일 | state.md `last_audit_wf_ts` | 정기 |
 | B3 | SSOT 전파 이벤트: `rules/*.md` 수정 **2건+** OR `skills/*/skill.md` 신규 | Edit 목록 + `find skills -mtime -N` | 전파 |
 | B4 | `decisions.jsonl` rollback 비율 ≥ **10%** (최근 50건) | grep count / 50 | 품질 |
-| B5 | `preflight-rules.md` 규칙 추가 ≥ 1건 | Phase A 가 append 여부 | 희귀 |
+| B5 | `preflight-rules.md` 규칙 추가 ≥ 1건 (observation 해제 이후) | Phase A append 여부 | 희귀 |
 | B6 | `MEMORY.md` 인덱스 영역 증분 ≥ 10 (ckpt 제외) | state.md `memory_index_last_count` 비교 | 인덱스 정합성 |
 
-하나라도 true → Phase B 진입. 모두 false → skip + batch 종료 (단 Phase Final 은 무조건).
+하나라도 true → Phase C 진입. 모두 false → skip (Phase Final 은 무조건 진행).
 
-**경량 분기 — Rules Propagation Subroutine**: `rules/*.md` 1건 단독 수정 (B3 full 미달) → full audit 대신 **포인터 레지스트리 전수 grep** 만 수행. 평균 10초, ruler-batch 오버헤드 無.
+**경량 분기 — Rules Propagation Subroutine**: `rules/*.md` 1건 단독 수정 (B3 full 미달) → full audit 대신 **포인터 레지스트리 전수 grep** 만 수행. 평균 10초.
 
-**Phase B 실행 순서**:
+### 실행 순서
+
 1. `Read ~/.claude/docs/verification/audit-promotion.md` → Phase 0.5 + 1~3M (B1 발동 시)
 2. `Read ~/.claude/docs/verification/audit-system.md` → Phase 3C + 5 + 6 (B2/B3)
 3. **B6 분기**: MEMORY.md 인덱스 ↔ `memory/**/*.md` 양방향 grep → 단절 항목 보강
 4. **B4 분기**: rollback 50건 분석 → rules/skill 품질 저하 원인 매핑
 5. **B5 분기**: 신규 preflight 규칙이 기존 워크플로우 충돌 dry-run
 6. 발견 이슈 즉시 자율 수정/승격 — 사용자 결정 프롬프트 금지
-7. **Phase Final — Hook SSOT sync (무조건, 마지막 단계)**:
-   - `settings.json` hook 섹션 ↔ `~/.claude/docs/operations/hook-guard-review.md` 양방향 diff
-   - 한쪽 누락 → 다른 쪽 기준 보강
-   - 설명/Tier 불일치 → **`hook-guard-review.md` 가 SSOT**
-   - **왜 마지막인가**: 중간 단계 수정으로 hook 이 생겨나거나 설명이 바뀐다. 정지 상태에서 한 번만 맞춘다.
-8. state.md 갱신: `last_audit_wf_ts`, `promotion_log_last_count`, `memory_index_last_count`
 
-**Phase C — 통합 요약 보고**:
-- Phase A + B 결과를 **단일 1~2문단 요약** 으로 출력. 긴 리스트 덤프 금지.
-- 포맷: "이번 retrospective: {rule_extracted}건 Pre-flight 추출, {applied}건 적용. 승격 감사: {promoted}건, {stale}건 정리. 훅 점검: {hook_checked}. 남은 이슈: {remaining}"
-- decisions.jsonl append: `{action:"retrospective_executed", phase_b:true|false, rules_applied:N, promoted:N, stale_cleaned:N}`
+### Phase C skip 시
 
-**완료 처리**:
+decisions.jsonl `phase_c:false, skip_reason:"B1=N B2=N ..."`. **Phase Final 은 생략하지 않음**.
+
+---
+
+## Phase Final — Hook SSOT Sync [유지, 무조건]
+
+- `settings.json` hook 섹션 ↔ `~/.claude/docs/operations/hook-guard-review.md` 양방향 diff
+- 한쪽 누락 → 다른 쪽 기준 보강
+- 설명/Tier 불일치 → **`hook-guard-review.md` 가 SSOT**
+- **왜 마지막인가**: Phase A/B/C 수정으로 hook 이 생겨나거나 설명이 바뀔 수 있다. 정지 상태에서 한 번만 맞춘다.
+- **무조건 수행**: Phase B/C skip 시에도 생략 불가.
+
+---
+
+## Phase Terminal — state 갱신 + self-terminate [기존 Phase C 이름변경]
+
+### 통합 요약 보고 (review.md 재정의)
+
+출력 형식 (기존 review.md 대체):
+
+```markdown
+---
+type: retrospective
+window: {pre_ts} ~ {post_ts}
+generated_by: ruler-batch-{ts}
+---
+
+## 이번 주 변경 × 효과 매트릭스 (Phase A)
+{change-impact 표 — GOOD/NEUTRAL/BAD/INSUFFICIENT 건수 요약 + 대표 사례 1-2건}
+
+## §0.5 준수 + Patrol Sync (Phase B)
+- 누락 감사: {N} 건 backfill (original_absent:true {M}건 → Phase A INSUFFICIENT)
+- Patrol Drift: T1 {N} / T2 {M} / clean {K}
+
+## 심층 감사 (Phase C, 조건부 실행)
+- 발동 조건: {B1-B6 true/false}
+- 실행 결과: {승격 N건, 정리 M건} OR "skipped"
+
+## Hook SSOT 점검 (Phase Final)
+- drift: {N건 → hook-guard-review.md 기준 보강}
+
+## 부록 — 빈도 패턴 (R1~R11, Phase A 판정 보조)
+{BAD 판정 건에 매칭된 R# 만 1-2줄 요약}
+```
+
+- 단일 1~2문단 최종 요약도 decisions.jsonl entry 로 append: `{action:"retrospective_executed", phase_a:{G,N,B,I 건수}, phase_b:{missing,T1,T2,clean 건수}, phase_c:bool, hook_drift:N}`
+
+### state.md 갱신
+
+`last_retrospective_ts`, `last_audit_wf_ts` (Phase C 실행 시), `promotion_log_last_count`, `memory_index_last_count` 갱신.
+
+### 완료 처리 → self-terminate (§0 Self-Terminate Protocol)
+
 - `[ruler-wf-end]` → 순찰 세션 수신
 - `.ruler/retrospective/{date}_plan.md` → `retrospective/done/`
-- batch 세션 자체 kill
+- batch 세션 자체 kill (`psmux kill-session -t $PSMUX_SESSION`)
 
-**Phase B skip 시**: decisions.jsonl `phase_b:false, skip_reason:"B1=N B2=N ..."`. skip 시에도 **Phase Final (Hook SSOT sync) 은 생략하지 않음**.
+---
 
-**원칙 재확인**: 3-phase 는 T2 Batch Resolver 와 같은 pipeline. 차이점 = 트리거가 "시간/비율 임계"(Retrospective) vs "pending 누적"(Batch). 실행 인프라 공유.
+## Pre-flight 규칙 등록 [유지]
+
+- `.ruler/preflight-rules.md` 는 patrol.md 와 별도 SSOT — 자동 생성 규칙 전용.
+- `t1-gate.sh` 가 Edit 직전 매칭 검사. `forbidden_change` 패턴 등장 → T2 강제 + decisions.jsonl `gate:"preflight_block"`.
+- 규칙 TTL 30일. 매칭 0건이면 자동 만료 (`.ruler/preflight-rules.md/archive/`).
+- 규칙 충돌 감지: 같은 target 다른 forbidden 2개+ → 다음 batch task 자동 큐잉.
+- **Observation-only 기간 (2026-04-18 ~ 2026-05-16)**: Phase A BAD 판정은 preflight 승격하지 않는다 (위 Phase A Observation-Only Mode 참조). R9 (TTL 만료) 자동 archive 는 계속 수행.
+
+---
 
 ## 자동화 경로 매핑 (사용자 액션 0 점검표)
 
 - ❌ "사용자 주간 리뷰" → ✅ batch 세션 7일 주기 자동 retrospective
-- ❌ "사용자 rollback 판정" → ✅ Step 0 semantic re-verify 자동 rollback
+- ❌ "사용자 rollback 판정" → ✅ Phase A Change-Impact Verdict 자동 판정
 - ❌ "사용자 force_opus_fallback 수동 해제" → ✅ 30 사이클 0 rollback 자동 clear
 - ❌ "사용자 regression ack" → ✅ run-all.sh 자동 rollback + promotion-log ERROR
 - ❌ "사용자 모델 전환 지시" → ✅ wake.sh 플래그 감지 자동 헬퍼 호출
+
+---
+
+## §부록 — R1~R11 빈도 패턴 (Phase A Δ 보조 재료)
+
+> **역할 변화**: 구 3-Phase 파이프라인에서 R1~R11 은 "빈도 관찰 → preflight 승격" 로직의 본체였으나, 본 재설계에서 **Phase A Verdict 의 보조 재료** 로 재배치. BAD 판정 신뢰도 강화 + 사문화 방지 + Pre-flight 규칙 TTL 연계.
+
+### R1~R11 판정 기준 (결정론적)
+
+| # | 패턴 | 임계 | 판정 | Phase 연계 |
+|---|---|---|---|---|
+| R1 | 동일 파일 T1 Edit | window 내 ≥3회 | **재수정 남용** | Phase A BAD 확증 |
+| R2 | retroactive_rollback | 1건+ | **Sonnet 오판 확정** | Phase A BAD 직접 트리거 |
+| R3 | 같은 체크 재발동 | T1 해결 후 동일 target 4 사이클 내 재출현 | **미완 수정** | Phase A BAD 확증 |
+| R4 | pending dropped 빈도 | window 내 ≥5건 stale drop | **pending 수명 초과** | Phase B Step 3 연계 |
+| R5 | 회귀 실패 | 1건+ | **인프라 취약** | Phase A BAD 확증 |
+| R6 | rollback_rate >5% | 2 window 연속 | **구조적 Sonnet 부적합** | Phase C B4 연계 |
+| R7 | same guard-deny | 서로 다른 세션 3회+ | **guard 규칙 자체 결함** | Phase B Step 3 연계 |
+| R8 | batch plan partial_failed | 1건+ | **의존성 그래프 결함** | Phase C B3 연계 |
+| R9 | preflight 매칭 0건 30일 | TTL 만료 | **규칙 사문화** | Pre-flight TTL 자동 archive |
+| R10 | 규칙 충돌 | 같은 target 서로 다른 forbidden 2개+ | **규칙 모순** | Pre-flight 등록 연계 |
+| R11 | 비서 미해결률 | ESCALATION / (WARN+SONNET) ≥ 0.5 (7d) | **elif 체인 부족** | Phase A BAD 확증 + Phase C |
+
+### 분석 쿼리 (Phase A `compute_change_impact()` 내부 활용)
+
+```bash
+# A. 재수정 패턴 (R1) — 동일 파일이 window 내 N회+ 수정
+tail -500 ~/.claude/.ruler/decisions.jsonl \
+  | jq -s '[.[] | select(.tier | test("T1|T2_batch_applied"))] | group_by(.file)[] | select(length>=3) | {file: .[0].file, count: length, cycles: [.[].cycle]}'
+
+# B. 원복 이력 (R2)
+tail -500 ~/.claude/.ruler/decisions.jsonl \
+  | jq -s '[.[] | select(.action=="retroactive_rollback" or .outcome=="rolled_back")]'
+
+# C. 규칙 위반 근접 (R3/R7)
+tail -500 ~/.claude/.ruler/decisions.jsonl \
+  | jq -s '[.[] | {check, cycle}] | group_by(.check)[] | select(length>=5)'
+```
+
+**사용 맥락**: `compute_change_impact()` 함수가 verdict=BAD 인 각 entry 에 대해 A/B/C 쿼리를 `--window 7d` 로 실행 후 매칭 R# 만 `Δ summary` 칼럼에 append. 매칭 없으면 보조 표기 생략 (§Phase A 보조 판정 규칙 준수).

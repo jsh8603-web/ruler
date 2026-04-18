@@ -3,6 +3,8 @@ type: ruler-patrol-manifest
 version: 4
 date: 2026-04-16
 tags: [ruler, patrol, manifest, hub, 2-tier, event-driven]
+last-edit: 20260418-1440
+last-edit-by: btn-ruler-step2
 ---
 
 # Ruler Patrol Manifest — 허브
@@ -47,6 +49,24 @@ cycle_count += 1
 
 - **sonnet-decide**: 기계적 탐지·측정, Sonnet 순찰이 즉시 수행 가능
 - **batch-only**: semantic 판정 필요, Sonnet 은 감지·수집만 → pending 에 넣고 batch 세션이 해결
+
+---
+
+## 사후 Retrospective 실행 순서
+
+> **SSOT**: [`~/.claude/.ruler/retrospective-guide.md`](~/.claude/.ruler/retrospective-guide.md) — 각 Phase 상세 절차는 해당 파일 참조. 본 섹션은 순서 요약 포인터.
+
+실행 순서: **Phase A → B → C → Final → Terminal**
+
+| Phase | 명칭 | 목적 | 조건 |
+|---|---|---|---|
+| **Phase A** | T1/T2 Change-Impact Verdict | 각 T1/T2 수정의 실제 효과 인과 판정 (GOOD/NEUTRAL/BAD/INSUFFICIENT) | 항상 (input JSON 없으면 skip → Phase B) |
+| **Phase B** | §0.5 Compliance Audit + Patrol Sync | §0.5 3단 기록 누락 감지 + patrol/event-rules/rules 의미 드리프트 동기화 | 항상 |
+| **Phase C** | 심층 감사 연계 (audit-wf 조건부) | 장기 drift / 파일 리스트 추적 / 인덱스 정합성 / rollback 품질 저하 | 결정론적 조건 B1~B6 중 하나라도 true |
+| **Phase Final** | Hook SSOT Sync | `settings.json` hook ↔ `hook-guard-review.md` 양방향 diff | **무조건** (Phase C skip 시에도 생략 불가) |
+| **Phase Terminal** | state 갱신 + self-terminate | `state.md` 갱신 + decisions.jsonl Phase C 요약 + self-terminate 5-step | 항상 (마지막) |
+
+**Phase C skip 시**: `decisions.jsonl` 에 `phase_c:false, skip_reason` append → Phase Final 은 계속 진행.
 
 ---
 

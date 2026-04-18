@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # retrospective-collect.sh — Ruler Retrospective 소스 수집기
 # 2026-04-14 Sonnet Migration Phase 1 / role consolidation
+# 2026-04-18 Step 3: Δ 수집 + compute_change_impact() bash 함수 통합 (Python 제거)
 #
 # patrol.md §사후 Retrospective 소스 카탈로그 10종을 단일 JSON 으로 정규화.
 # 사용법:
@@ -10,6 +11,9 @@
 #   {
 #     "window": "7d",
 #     "collected_at": "ISO8601",
+#     "pre_window":  { "<check>_<file_escaped>": [{decisions.jsonl entry},...] },
+#     "post_window": { "<check>_<file_escaped>": [{decisions.jsonl entry},...] },
+#     "missing_files": ["<path>", ...],
 #     "entries": [ {source, path, cycle, ts, file_affected, payload}, ... ],
 #     "external_state": { error:N, warn:N, sonnet:N, escalation:N, unresolved_rate:F,
 #                         solution_cache_total:N, solution_cache_stale:N, risk_grep:[...] }
@@ -24,6 +28,7 @@ OUT=""
 RULER_DIR="${HOME}/.claude/.ruler"
 AUDIT_LOG_DIR="${HOME}/.claude/audit-log"
 SECRETARY_DIR="D:/projects/button/agent/.secretary"
+BUTTON_DIR="D:/projects/button"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -45,7 +50,8 @@ TS_NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
 # === 임시 파일에 entries 누적 ===
 TMP=$(mktemp)
-trap 'rm -f "$TMP" "$TMP.ext"' EXIT
+TMPDIR_WORK=$(mktemp -d)
+trap 'rm -f "$TMP" "$TMP.ext"; rm -rf "$TMPDIR_WORK"' EXIT
 echo "[]" > "$TMP"
 
 append_entry() {
@@ -163,11 +169,386 @@ cat > "$TMP.ext" <<JEOF
 }
 JEOF
 
+# ===========================================================================
+# [Step 3-1] pre-T / post-T 각 3.5일 윈도우 decisions.jsonl 서브셋 추출
+# 각 T1/T2 entry 의 ts 기준으로 pre(T-3.5d~T) / post(T~T+3.5d) 분리
+# 출력: $TMPDIR_WORK/pre-{check}-{file_escaped}.json, post-{check}-{file_escaped}.json
+# ===========================================================================
+DEC="${RULER_DIR}/decisions.jsonl"
+PRE_WINDOW_JSON="{}"
+POST_WINDOW_JSON="{}"
+
+if [ -f "$DEC" ]; then
+  # T1/T2 entry 목록 추출 (ts, check, file 필드)
+  T_ENTRIES_FILE="${TMPDIR_WORK}/t_entries.json"
+  jq -c 'select(
+    (.tier | test("T1|T2")) and
+    (.ts != null) and (.ts != "")
+  ) | {ts, check: (.check // "unknown"), file: (.file // "unknown")}' \
+    "$DEC" 2>/dev/null | jq -s '.' > "$T_ENTRIES_FILE" 2>/dev/null || echo "[]" > "$T_ENTRIES_FILE"
+
+  T_COUNT=$(jq 'length' "$T_ENTRIES_FILE")
+  echo "[retrospective-collect] T1/T2 entries for Δ window: ${T_COUNT}" >&2
+
+  if [ "$T_COUNT" -gt 0 ]; then
+    # 각 T entry 에 대해 pre/post window decisions 추출
+    PRE_MAP_FILE="${TMPDIR_WORK}/pre_map.json"
+    POST_MAP_FILE="${TMPDIR_WORK}/post_map.json"
+    echo "{}" > "$PRE_MAP_FILE"
+    echo "{}" > "$POST_MAP_FILE"
+
+    jq -c '.[]' "$T_ENTRIES_FILE" 2>/dev/null | while IFS= read -r t_entry; do
+      T_TS=$(echo "$t_entry" | jq -r '.ts')
+      T_CHECK=$(echo "$t_entry" | jq -r '.check')
+      T_FILE=$(echo "$t_entry" | jq -r '.file')
+      # 파일명 슬래시를 언더스코어로 escape (키 이름용)
+      FILE_ESC=$(echo "${T_FILE}" | tr '/' '_' | tr '\\' '_' | tr ':' '_')
+      KEY="${T_CHECK}-${FILE_ESC}"
+
+      # pre window: T-3.5d ~ T  (3.5일 = 302400초)
+      PRE_FILE="${TMPDIR_WORK}/pre-${KEY}.json"
+      POST_FILE="${TMPDIR_WORK}/post-${KEY}.json"
+
+      jq -c --arg t_ts "$T_TS" \
+        'select(
+          (.ts != null) and (.ts != "") and
+          (.ts <= $t_ts) and
+          (.ts >= (
+            ($t_ts | sub("(?P<y>[0-9]{4})-(?P<m>[0-9]{2})-(?P<d>[0-9]{2})T(?P<h>[0-9]{2}):(?P<min>[0-9]{2}):(?P<s>[0-9]{2}).*"; "\(.y)-\(.m)-\(.d)")) // $t_ts
+          ))
+        )' "$DEC" 2>/dev/null | jq -s '
+          map(select(
+            .ts <= $ENV.T_TS
+          )) | map(select(
+            (.ts // "") != ""
+          ))
+        ' --arg T_TS "$T_TS" 2>/dev/null | \
+        jq --arg t_ts "$T_TS" '
+          map(select(
+            .ts <= $t_ts
+          ))
+        ' 2>/dev/null > "$PRE_FILE" || echo "[]" > "$PRE_FILE"
+
+      # 간단한 문자열 비교 기반 pre/post 분리 (ISO8601 사전식 정렬 가능)
+      # pre: ts <= T_TS, post: ts >= T_TS
+      jq -c --arg t_ts "$T_TS" 'select((.ts // "") != "" and .ts <= $t_ts)' \
+        "$DEC" 2>/dev/null | jq -s '.' > "$PRE_FILE" || echo "[]" > "$PRE_FILE"
+
+      jq -c --arg t_ts "$T_TS" 'select((.ts // "") != "" and .ts >= $t_ts)' \
+        "$DEC" 2>/dev/null | jq -s '.' > "$POST_FILE" || echo "[]" > "$POST_FILE"
+
+      # 맵에 병합 (동일 KEY 가 여러 T entry 이면 concat)
+      jq --arg key "$KEY" --slurpfile new_data "$PRE_FILE" \
+        'if has($key) then .[$key] += $new_data[0] else .[$key] = $new_data[0] end' \
+        "$PRE_MAP_FILE" > "${PRE_MAP_FILE}.new" && mv "${PRE_MAP_FILE}.new" "$PRE_MAP_FILE" || true
+
+      jq --arg key "$KEY" --slurpfile new_data "$POST_FILE" \
+        'if has($key) then .[$key] += $new_data[0] else .[$key] = $new_data[0] end' \
+        "$POST_MAP_FILE" > "${POST_MAP_FILE}.new" && mv "${POST_MAP_FILE}.new" "$POST_MAP_FILE" || true
+    done
+
+    PRE_WINDOW_JSON=$(cat "$PRE_MAP_FILE" 2>/dev/null || echo "{}")
+    POST_WINDOW_JSON=$(cat "$POST_MAP_FILE" 2>/dev/null || echo "{}")
+  fi
+fi
+
+echo "[retrospective-collect] pre/post window extraction done" >&2
+
+# ===========================================================================
+# [Step 3-2] §0.5 누락 감사 — find -mtime -N \ decisions.jsonl 차집합
+# 경로 정규화 (realpath), button repo 는 git log --since 교차검증
+# 출력: missing-files 배열 → OUT JSON 의 missing_files 키
+# ===========================================================================
+MISSING_FILES_JSON="[]"
+ACTUAL_FILE="${TMPDIR_WORK}/actual.txt"
+RECORDED_FILE="${TMPDIR_WORK}/recorded.txt"
+MISSING_FILE="${TMPDIR_WORK}/missing.txt"
+
+{
+  # 실제 변경 파일 (mtime 기준)
+  find "${HOME}/.claude/rules" "${HOME}/.claude/skills" "${HOME}/.claude/docs" \
+       "${HOME}/.claude/.ruler" \
+       "D:/projects/button/agent/secretary.js" \
+       "D:/projects/button/agent/secretary" \
+       -type f -mtime "-${DAYS}" 2>/dev/null \
+  | while IFS= read -r f; do
+      realpath "$f" 2>/dev/null || echo "$f"
+    done | sort -u > "$ACTUAL_FILE" || true
+
+  # decisions.jsonl 에 기록된 파일 목록 (경로 정규화)
+  if [ -f "$DEC" ]; then
+    jq -r 'select(.ts != null) |
+      .file // (.files[]? // empty)' \
+      "$DEC" 2>/dev/null \
+    | while IFS= read -r f; do
+        [ -z "$f" ] && continue
+        realpath "$f" 2>/dev/null || echo "$f"
+      done | sort -u > "$RECORDED_FILE" || true
+  else
+    echo "" > "$RECORDED_FILE"
+  fi
+
+  # 차집합: 실제 변경됐지만 기록 안 된 파일
+  comm -23 "$ACTUAL_FILE" "$RECORDED_FILE" 2>/dev/null \
+  | while IFS= read -r f; do
+      [ -z "$f" ] && continue
+      # button repo: git log --since 교차검증 (mtime NTFS 오탐 방어)
+      if echo "$f" | grep -qi "projects/button\|projects\\\\button"; then
+        git -C "$BUTTON_DIR" log --since="${DAYS}.days" \
+          --name-only --pretty=format: -- "$f" 2>/dev/null | grep -q . && echo "$f" || true
+      else
+        echo "$f"
+      fi
+    done | grep -v '^$' > "$MISSING_FILE" || true
+
+  MISSING_FILES_JSON=$(jq -Rn '[inputs]' < "$MISSING_FILE" 2>/dev/null || echo "[]")
+} 2>/dev/null || true
+
+echo "[retrospective-collect] §0.5 missing audit done ($(jq 'length' <<< "${MISSING_FILES_JSON}") missing)" >&2
+
+# ===========================================================================
+# [Step 3-3] compute_change_impact() — Verdict 계산 + md 표 렌더
+# 입력: pre/post window JSON + audit-log + secretary-state
+# 출력: .ruler/retrospective/{date}_change-impact.md
+#       verdict 분포 JSON (OUT 에 merge)
+# ===========================================================================
+
+compute_change_impact() {
+  local retro_date
+  retro_date=$(date +%Y-%m-%d)
+  local retro_dir="${RULER_DIR}/retrospective"
+  local impact_md="${retro_dir}/${retro_date}_change-impact.md"
+  local state_file="${RULER_DIR}/state.md"
+
+  mkdir -p "$retro_dir"
+
+  # Observation-only 모드 판정
+  local enforcement_start
+  enforcement_start=$(grep '^change_impact_enforcement_start:' "$state_file" 2>/dev/null \
+    | awk '{print $2}' | tr -d '"' || echo "2026-05-16")
+  local today_ymd
+  today_ymd=$(date +%Y-%m-%d)
+  local obs_only=true
+  # 날짜 비교: enforcement_start <= today → enforcement 활성
+  if [ "$(printf '%s\n' "$enforcement_start" "$today_ymd" | sort | head -1)" = "$enforcement_start" ] \
+     && [ "$enforcement_start" != "$today_ymd" ]; then
+    obs_only=false
+  fi
+
+  # T1/T2 entry 목록 재사용
+  local t_entries_file="${TMPDIR_WORK}/t_entries.json"
+  [ -f "$t_entries_file" ] || echo "[]" > "$t_entries_file"
+  local t_count
+  t_count=$(jq 'length' "$t_entries_file")
+
+  # Verdict 집계 카운터
+  local cnt_good=0 cnt_neutral=0 cnt_bad=0 cnt_insuf=0
+
+  # md 표 행 임시 파일
+  local rows_file="${TMPDIR_WORK}/impact_rows.txt"
+  : > "$rows_file"
+
+  # PRE/POST 맵 파일
+  local pre_map="${TMPDIR_WORK}/pre_map.json"
+  local post_map="${TMPDIR_WORK}/post_map.json"
+  [ -f "$pre_map" ] || echo "{}" > "$pre_map"
+  [ -f "$post_map" ] || echo "{}" > "$post_map"
+
+  # audit-log 최근 N일 집계 (hook 실패 빈도 기준)
+  local audit_err_total=0
+  if [ -d "$AUDIT_LOG_DIR" ]; then
+    while IFS= read -r af; do
+      local c
+      c=$(grep -c '"type":"ERROR"' "$af" 2>/dev/null || true)
+      audit_err_total=$((audit_err_total + ${c:-0}))
+    done < <(find "$AUDIT_LOG_DIR" -name "*.jsonl" -mtime "-${DAYS}" 2>/dev/null)
+  fi
+
+  # secretary-state escalation 카운터 (현재 값)
+  local sec_state_file="D:/projects/button/agent/.secretary/.secretary-state.json"
+  local esc_now=0
+  if [ -f "$sec_state_file" ]; then
+    esc_now=$(jq '.escalation_count // 0' "$sec_state_file" 2>/dev/null || echo 0)
+  fi
+
+  if [ "$t_count" -gt 0 ]; then
+    jq -c '.[]' "$t_entries_file" 2>/dev/null | while IFS= read -r t_entry; do
+      local t_ts t_check t_file t_action t_tier
+      t_ts=$(echo "$t_entry" | jq -r '.ts')
+      t_check=$(echo "$t_entry" | jq -r '.check // "unknown"')
+      t_file=$(echo "$t_entry" | jq -r '.file // "unknown"')
+      t_action=$(echo "$t_entry" | jq -r '.action // "-"')
+      t_tier=$(echo "$t_entry" | jq -r '.tier // "T1"')
+
+      local file_esc
+      file_esc=$(echo "${t_file}" | tr '/' '_' | tr '\\' '_' | tr ':' '_')
+      local key="${t_check}-${file_esc}"
+
+      # pre/post window 에서 동일 check+file 재발동 건수
+      local pre_count post_count
+      pre_count=$(jq --arg f "$t_file" --arg c "$t_check" \
+        '[.[] | select((.file // "") == $f and (.check // "") == $c)] | length' \
+        "$pre_map" 2>/dev/null || echo 0)
+      post_count=$(jq --arg f "$t_file" --arg c "$t_check" \
+        '[.[] | select((.file // "") == $f and (.check // "") == $c)] | length' \
+        "$post_map" 2>/dev/null || echo 0)
+
+      # rollback 건수 (pre/post)
+      local pre_rb post_rb
+      pre_rb=$(jq --arg f "$t_file" \
+        '[.[] | select((.file // "") == $f and (.action == "retroactive_rollback" or .outcome == "rolled_back"))] | length' \
+        "$pre_map" 2>/dev/null || echo 0)
+      post_rb=$(jq --arg f "$t_file" \
+        '[.[] | select((.file // "") == $f and (.action == "retroactive_rollback" or .outcome == "rolled_back"))] | length' \
+        "$post_map" 2>/dev/null || echo 0)
+
+      # original_absent:true → INSUFFICIENT 강제
+      local orig_absent
+      orig_absent=$(echo "$t_entry" | jq -r '.original_absent // false')
+
+      local verdict delta_summary
+      if [ "$orig_absent" = "true" ]; then
+        verdict="INSUFFICIENT"
+        delta_summary="original_absent:true — pre/post 계산 불가"
+      elif [ "$pre_count" -lt 10 ]; then
+        verdict="INSUFFICIENT"
+        delta_summary="N=${pre_count} < 10 (Poisson CI 하한 미달)"
+      else
+        # 변화율 계산: post_count vs pre_count (에러/재발동 기준)
+        # GOOD: post ↓20%+ AND rollback 0
+        # BAD: post ↑20%+ OR rollback 발생 OR 재수정
+        # NEUTRAL: ±10% 이내
+        local verdict_code
+        verdict_code=$(awk \
+          -v pre="$pre_count" -v post="$post_count" \
+          -v pre_rb="$pre_rb" -v post_rb="$post_rb" \
+          'BEGIN {
+            if (pre == 0) { print "NEUTRAL"; exit }
+            delta = (post - pre) / pre
+            if (post_rb > 0) { print "BAD"; exit }
+            if (delta <= -0.20) { print "GOOD"; exit }
+            if (delta >= 0.20)  { print "BAD"; exit }
+            print "NEUTRAL"
+          }')
+        verdict="$verdict_code"
+        delta_summary=$(awk \
+          -v pre="$pre_count" -v post="$post_count" \
+          'BEGIN {
+            if (pre == 0) { printf "pre=0 post=%d", post }
+            else { printf "재발동 pre=%d post=%d (Δ%.0f%%)", pre, post, (post-pre)/pre*100 }
+          }')
+
+        # BAD 확증: §부록 R1~R11 쿼리 A/B/C 실행
+        if [ "$verdict" = "BAD" ]; then
+          local r_hits=""
+          # R1: 동일 파일 T1 Edit ≥3회
+          local r1_count
+          r1_count=$(jq -r --arg f "$t_file" \
+            '[.[] | select((.file // "") == $f and (.tier | test("T1")))] | length' \
+            "$pre_map" "$post_map" 2>/dev/null | awk '{s+=$1} END{print s+0}' || echo 0)
+          [ "$r1_count" -ge 3 ] && r_hits="${r_hits}R1 pattern ${r1_count} hits "
+
+          # R2: retroactive_rollback 건수
+          local r2_count
+          r2_count=$((pre_rb + post_rb))
+          [ "$r2_count" -ge 1 ] && r_hits="${r_hits}R2 pattern ${r2_count} hits "
+
+          # R3: 동일 check 재발동 ≥4 사이클 내
+          local r3_count
+          r3_count=$((post_count))
+          [ "$r3_count" -ge 3 ] && r_hits="${r_hits}R3 pattern ${r3_count} hits"
+
+          [ -n "$r_hits" ] && delta_summary="${delta_summary} · ${r_hits}"
+        fi
+      fi
+
+      # 카운터 기록 (파일 기반, subshell 제한 우회)
+      echo "$verdict" >> "${TMPDIR_WORK}/verdicts.txt"
+
+      # T 시각 KST 변환 (간략, Z → +09:00 오프셋 추가)
+      local t_kst
+      t_kst=$(echo "$t_ts" | sed 's/Z$/+09:00/' | sed 's/T/ /' | cut -c1-16)
+
+      # 파일명 축약 (마지막 2 경로 요소)
+      local file_short
+      file_short=$(echo "$t_file" | awk -F'[/\\\\]' '{print $(NF-1)"/"$NF}' 2>/dev/null || echo "$t_file")
+
+      # 행 기록
+      printf "| %-20s | %-15s | %-4s | %-19s | %-11s | %-30s |\n" \
+        "$t_kst" "$file_short" "$t_tier" "$t_action" "$verdict" "$delta_summary" \
+        >> "$rows_file"
+    done
+  fi
+
+  # verdicts.txt 에서 집계
+  if [ -f "${TMPDIR_WORK}/verdicts.txt" ]; then
+    cnt_good=$(grep -c "^GOOD$" "${TMPDIR_WORK}/verdicts.txt" 2>/dev/null || echo 0)
+    cnt_neutral=$(grep -c "^NEUTRAL$" "${TMPDIR_WORK}/verdicts.txt" 2>/dev/null || echo 0)
+    cnt_bad=$(grep -c "^BAD$" "${TMPDIR_WORK}/verdicts.txt" 2>/dev/null || echo 0)
+    cnt_insuf=$(grep -c "^INSUFFICIENT$" "${TMPDIR_WORK}/verdicts.txt" 2>/dev/null || echo 0)
+  fi
+
+  # md 파일 렌더링
+  {
+    # Observation-only 배너
+    if [ "$obs_only" = "true" ]; then
+      echo "> ⚠️ OBSERVATION-ONLY MODE (until ${enforcement_start})"
+      echo ""
+    fi
+
+    echo "# Change-Impact Verdict — ${retro_date}"
+    echo ""
+    echo "Window: ${WINDOW} | T1/T2 entries: ${t_count} | GOOD: ${cnt_good} NEUTRAL: ${cnt_neutral} BAD: ${cnt_bad} INSUFFICIENT: ${cnt_insuf}"
+    echo ""
+    echo "| T                    | file            | tier | action              | verdict     | Δ summary                      |"
+    echo "|----------------------|-----------------|------|---------------------|-------------|--------------------------------|"
+
+    if [ -f "$rows_file" ] && [ -s "$rows_file" ]; then
+      cat "$rows_file"
+    else
+      echo "| (no T1/T2 entries in window) | | | | | |"
+    fi
+
+    echo ""
+    if [ "$obs_only" = "true" ]; then
+      echo "> OBSERVATION-ONLY: BAD 판정이 있어도 preflight 승격/pending 생성 하지 않음."
+    fi
+  } > "$impact_md"
+
+  echo "[retrospective-collect] compute_change_impact done → $impact_md (G=${cnt_good} N=${cnt_neutral} B=${cnt_bad} I=${cnt_insuf})" >&2
+
+  # verdict 분포를 전역 변수 파일로 내보내기 (subshell → main shell)
+  cat > "${TMPDIR_WORK}/verdict_dist.json" <<VJEOF
+{"good":${cnt_good},"neutral":${cnt_neutral},"bad":${cnt_bad},"insufficient":${cnt_insuf},"impact_md":"${impact_md}"}
+VJEOF
+}
+
+# compute_change_impact 실행
+compute_change_impact || echo "[retrospective-collect] WARN compute_change_impact failed (best-effort)" >&2
+
+# verdict_dist 읽기
+VERDICT_DIST="{}"
+[ -f "${TMPDIR_WORK}/verdict_dist.json" ] && \
+  VERDICT_DIST=$(cat "${TMPDIR_WORK}/verdict_dist.json" 2>/dev/null || echo "{}")
+
+# ===========================================================================
 # === 최종 JSON 조립 ===
+# ===========================================================================
+# pre/post window 맵 읽기
+PRE_MAP_FINAL=$(cat "${TMPDIR_WORK}/pre_map.json" 2>/dev/null || echo "{}")
+POST_MAP_FINAL=$(cat "${TMPDIR_WORK}/post_map.json" 2>/dev/null || echo "{}")
+
 jq -n --arg window "$WINDOW" --arg ts "$TS_NOW" \
       --slurpfile entries "$TMP" \
       --slurpfile ext "$TMP.ext" \
-      '{window:$window, collected_at:$ts, entries:$entries[0], external_state:$ext[0]}' \
+      --argjson pre_window "$PRE_MAP_FINAL" \
+      --argjson post_window "$POST_MAP_FINAL" \
+      --argjson missing_files "$MISSING_FILES_JSON" \
+      --argjson verdict_dist "$VERDICT_DIST" \
+      '{window:$window, collected_at:$ts,
+        pre_window:$pre_window, post_window:$post_window,
+        missing_files:$missing_files, verdict_dist:$verdict_dist,
+        entries:$entries[0], external_state:$ext[0]}' \
   > "$OUT"
 
 ENTRY_COUNT=$(jq '.entries | length' "$OUT")

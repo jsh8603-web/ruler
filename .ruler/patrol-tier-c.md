@@ -2,6 +2,7 @@
 type: ruler-patrol-tier-c
 version: 1
 date: 2026-04-16
+last-edit: 2026-04-18T_btn-ruler-step8-agent_C_external추가
 tags: [ruler, patrol, tier-c, checklist]
 ---
 
@@ -465,6 +466,56 @@ sonnet-decide (mtime 기계 검사)
 ### 판정 모드
 
 sonnet-decide (U1/U2/U4) + opus-decide (U3 재시도 전략)
+
+---
+
+## C_external — 외부 skill drift 감지 (2026-04-18 신설)
+
+> plan §6.5.4 "외부 skill 2개 drift 추적" 반영. ruler-wf/audit-wf skill.md 가 외부 세션에 의해 무단으로 수정되면 patrol 이 감지한다.
+
+### 목적
+
+`~/.claude/skills/ruler-wf/skill.md` 및 `~/.claude/skills/audit-wf/skill.md` 의 sha256 기준값을 `.ruler/external-skill-checksums.md` 에 저장하고, Tier C 30분 사이클에서 실제 파일 해시와 대조하여 drift 를 감지한다.
+
+### 검사
+
+- **대상 파일**:
+  - `~/.claude/skills/ruler-wf/skill.md`
+  - `~/.claude/skills/audit-wf/skill.md`
+- **기준값**: `.ruler/external-skill-checksums.md` 에 저장된 sha256
+- **방법**: `sha256sum ~/.claude/skills/ruler-wf/skill.md ~/.claude/skills/audit-wf/skill.md` 출력 ↔ checksums.md 저장값 비교
+
+### 조치
+
+- **drift 감지 시** (sha256 불일치):
+  1. `decisions.jsonl` 에 즉시 append:
+     ```json
+     {"check":"C_external","tier":"T1","file":"<drifted path>","action":"drift_detected","reason":"sha256 mismatch"}
+     ```
+  2. `log/{date}.md` 에 1줄 기록 (drifted 파일 경로 + 이전/신규 해시 앞 8자)
+  3. T2 pending 생성 — 의도적 수정인지 무단 수정인지 batch 에서 판단
+
+- **의도적 수정 확인 시** (decisions.jsonl 에 해당 파일의 edit entry 존재):
+  - checksums.md 도 신규 해시로 갱신 (자동 갱신)
+  - T2 pending 생략 가능
+
+### checksums.md 포맷 (`.ruler/external-skill-checksums.md`)
+
+```
+# external-skill-checksums
+# 갱신: ruler Tier C C_external 체크 시 자동 갱신 (의도적 수정 확정 후)
+ruler-wf/skill.md: <sha256hex>
+audit-wf/skill.md: <sha256hex>
+last-updated: YYYY-MM-DDTHH:MM:SSZ
+```
+
+### 주기
+
+Tier C 30분 사이클 내 1회 실행.
+
+### 판정 모드
+
+sonnet-decide (sha256 기계 비교) / batch-only (무단 vs 의도적 수정 판단)
 
 ---
 

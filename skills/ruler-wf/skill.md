@@ -11,7 +11,7 @@ description: |
   Self-Wake 3분 루프. 2-Tier + 이벤트 기반 순찰 (Tier A 3분 매 사이클, Tier C 30분 10사이클마다). 리스크 없는 수정 자율 적용.
   트리거: "ruler 스폰", "ruler 띄워", "ruler wf", "메타 감시 세션"
   사용자 명시 요청 시에만 harness/lightweight-wf 가 스폰. WF 종료 시 정리하지 않는다.
-date: 2026-04-16
+date: 2026-04-18
 ---
 
 # Ruler WF — 규칙·문서·비서코드 메타 감시 레이어
@@ -187,6 +187,10 @@ SSOT: [`~/.claude/.ruler/model-separation.md`](~/.claude/.ruler/model-separation
 ## §5b. Retrospective 수동 트리거
 
 SSOT: [`~/.claude/.ruler/retrospective-guide.md`](~/.claude/.ruler/retrospective-guide.md) — 메인 세션 `주간리뷰` / `룰러 리뷰` 키워드 → `ruler-batch-{ts}` 직접 스폰 5-step 프로토콜 + 초기 프롬프트 필수 요소 + 자동/수동 경로 비교 전부 해당 파일.
+
+**Phase A — Change-Impact Verdict (Primary)**: 각 T1/T2 수정이 실제로 에러/rollback 을 줄였는지 (GOOD), 재수정·회귀를 유발했는지 (BAD), 변화 없음 (NEUTRAL), 데이터 부족 (INSUFFICIENT) 을 4등급 verdict 로 판정. 입력 = decisions.jsonl 7일 + audit-log hook + secretary-state. 산출물: `.ruler/retrospective/{YYYY-MM-DD}_change-impact.md` 표. **Observation-only 모드 (2026-04-18 ~ 2026-05-16, 4주)**: verdict 산출+기록만, preflight 승격/pending 생성/handoff 트리거 차단.
+
+**Phase B — §0.5 Compliance Audit + Patrol Sync (Secondary)**: §0.5 3단 기록 누락 감지 (find mtime vs decisions.jsonl 차집합, realpath + git log 교차검증) + backfill (`original_absent:true` 플래그) + patrol 규칙 드리프트 동기화 (LLM 의미 비교, patrol*/event-rules*/rules/*.md 만). 산출물: `.ruler/retrospective/{YYYY-MM-DD}_compliance.md`.
 
 ---
 
