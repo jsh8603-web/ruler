@@ -23,6 +23,18 @@
 
 set -euo pipefail
 
+# jq PATH 보강 — 시스템 PATH 에 jq 없고 node-jq 경로만 존재하는 Windows 환경 대응
+# (msys2 bash 의 PATH 에는 /mingw64/bin, /usr/bin 있으나 jq 미설치)
+if ! command -v jq >/dev/null 2>&1; then
+  JQ_NODE="/c/Users/jsh86/AppData/Roaming/npm/node_modules/node-jq/bin/jq.exe"
+  if [ -x "$JQ_NODE" ]; then
+    export PATH="$(dirname "$JQ_NODE"):$PATH"
+  else
+    echo "[retrospective-collect] FATAL: jq not found in PATH and node-jq missing at $JQ_NODE" >&2
+    exit 1
+  fi
+fi
+
 WINDOW="7d"
 OUT=""
 RULER_DIR="${HOME}/.claude/.ruler"
@@ -209,33 +221,27 @@ if [ -f "$DEC" ]; then
       PRE_FILE="${TMPDIR_WORK}/pre-${KEY}.json"
       POST_FILE="${TMPDIR_WORK}/post-${KEY}.json"
 
-      jq -c --arg t_ts "$T_TS" \
-        'select(
-          (.ts != null) and (.ts != "") and
-          (.ts <= $t_ts) and
-          (.ts >= (
-            ($t_ts | sub("(?P<y>[0-9]{4})-(?P<m>[0-9]{2})-(?P<d>[0-9]{2})T(?P<h>[0-9]{2}):(?P<min>[0-9]{2}):(?P<s>[0-9]{2}).*"; "\(.y)-\(.m)-\(.d)")) // $t_ts
-          ))
-        )' "$DEC" 2>/dev/null | jq -s '
-          map(select(
-            .ts <= $ENV.T_TS
-          )) | map(select(
-            (.ts // "") != ""
-          ))
-        ' --arg T_TS "$T_TS" 2>/dev/null | \
-        jq --arg t_ts "$T_TS" '
-          map(select(
-            .ts <= $t_ts
-          ))
-        ' 2>/dev/null > "$PRE_FILE" || echo "[]" > "$PRE_FILE"
+      # 시간 경계: pre = [T-3.5d, T], post = [T, T+3.5d]
+      # guide §Phase A: Pre-Δ (T-3.5d ~ T) / Post-Δ (T ~ T+3.5d)
+      # date -d 로 offset 계산. 실패 시 단순 이분할로 degrade.
+      T_PRE=$(date -u -d "${T_TS} - 3.5 days" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "")
+      T_POST_END=$(date -u -d "${T_TS} + 3.5 days" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "")
 
-      # 간단한 문자열 비교 기반 pre/post 분리 (ISO8601 사전식 정렬 가능)
-      # pre: ts <= T_TS, post: ts >= T_TS
-      jq -c --arg t_ts "$T_TS" 'select((.ts // "") != "" and .ts <= $t_ts)' \
-        "$DEC" 2>/dev/null | jq -s '.' > "$PRE_FILE" || echo "[]" > "$PRE_FILE"
+      if [ -n "$T_PRE" ] && [ -n "$T_POST_END" ]; then
+        jq -c --arg t_ts "$T_TS" --arg t_pre "$T_PRE" \
+          'select((.ts // "") != "" and .ts >= $t_pre and .ts <= $t_ts)' \
+          "$DEC" 2>/dev/null | jq -s '.' > "$PRE_FILE" || echo "[]" > "$PRE_FILE"
 
-      jq -c --arg t_ts "$T_TS" 'select((.ts // "") != "" and .ts >= $t_ts)' \
-        "$DEC" 2>/dev/null | jq -s '.' > "$POST_FILE" || echo "[]" > "$POST_FILE"
+        jq -c --arg t_ts "$T_TS" --arg t_end "$T_POST_END" \
+          'select((.ts // "") != "" and .ts >= $t_ts and .ts <= $t_end)' \
+          "$DEC" 2>/dev/null | jq -s '.' > "$POST_FILE" || echo "[]" > "$POST_FILE"
+      else
+        # fallback: date 실패 시 이분할 (경계 없음)
+        jq -c --arg t_ts "$T_TS" 'select((.ts // "") != "" and .ts <= $t_ts)' \
+          "$DEC" 2>/dev/null | jq -s '.' > "$PRE_FILE" || echo "[]" > "$PRE_FILE"
+        jq -c --arg t_ts "$T_TS" 'select((.ts // "") != "" and .ts >= $t_ts)' \
+          "$DEC" 2>/dev/null | jq -s '.' > "$POST_FILE" || echo "[]" > "$POST_FILE"
+      fi
 
       # 맵에 병합 (동일 KEY 가 여러 T entry 이면 concat)
       jq --arg key "$KEY" --slurpfile new_data "$PRE_FILE" \
@@ -385,21 +391,22 @@ compute_change_impact() {
       local key="${t_check}-${file_esc}"
 
       # pre/post window 에서 동일 check+file 재발동 건수
+      # pre_map/post_map 구조: { "key": [entry, entry, ...] } → .[] | .[] 로 flatten
       local pre_count post_count
       pre_count=$(jq --arg f "$t_file" --arg c "$t_check" \
-        '[.[] | select((.file // "") == $f and (.check // "") == $c)] | length' \
+        '[.[] | .[] | select((.file // "") == $f and (.check // "") == $c)] | length' \
         "$pre_map" 2>/dev/null || echo 0)
       post_count=$(jq --arg f "$t_file" --arg c "$t_check" \
-        '[.[] | select((.file // "") == $f and (.check // "") == $c)] | length' \
+        '[.[] | .[] | select((.file // "") == $f and (.check // "") == $c)] | length' \
         "$post_map" 2>/dev/null || echo 0)
 
       # rollback 건수 (pre/post)
       local pre_rb post_rb
       pre_rb=$(jq --arg f "$t_file" \
-        '[.[] | select((.file // "") == $f and (.action == "retroactive_rollback" or .outcome == "rolled_back"))] | length' \
+        '[.[] | .[] | select((.file // "") == $f and (.action == "retroactive_rollback" or .outcome == "rolled_back"))] | length' \
         "$pre_map" 2>/dev/null || echo 0)
       post_rb=$(jq --arg f "$t_file" \
-        '[.[] | select((.file // "") == $f and (.action == "retroactive_rollback" or .outcome == "rolled_back"))] | length' \
+        '[.[] | .[] | select((.file // "") == $f and (.action == "retroactive_rollback" or .outcome == "rolled_back"))] | length' \
         "$post_map" 2>/dev/null || echo 0)
 
       # original_absent:true → INSUFFICIENT 강제
@@ -438,25 +445,33 @@ compute_change_impact() {
             else { printf "재발동 pre=%d post=%d (Δ%.0f%%)", pre, post, (post-pre)/pre*100 }
           }')
 
-        # BAD 확증: §부록 R1~R11 쿼리 A/B/C 실행
+        # BAD 확증: §부록 R1~R11 쿼리 — guide 스펙 "pre 대비 +50% 이상이면 BAD 확정 보조 표기"
+        # 방식: R1/R3 는 post ≥ max(임계, pre × 1.5) 일 때만 hit, R2 는 발생 여부만
         if [ "$verdict" = "BAD" ]; then
           local r_hits=""
-          # R1: 동일 파일 T1 Edit ≥3회
-          local r1_count
-          r1_count=$(jq -r --arg f "$t_file" \
-            '[.[] | select((.file // "") == $f and (.tier | test("T1")))] | length' \
-            "$pre_map" "$post_map" 2>/dev/null | awk '{s+=$1} END{print s+0}' || echo 0)
-          [ "$r1_count" -ge 3 ] && r_hits="${r_hits}R1 pattern ${r1_count} hits "
+          # R1: 동일 파일 T1 Edit ≥3회 AND post ≥ pre*1.5
+          local r1_pre r1_post
+          r1_pre=$(jq -r --arg f "$t_file" \
+            '[.[] | .[] | select((.file // "") == $f and (.tier | test("T1")))] | length' \
+            "$pre_map" 2>/dev/null || echo 0)
+          r1_post=$(jq -r --arg f "$t_file" \
+            '[.[] | .[] | select((.file // "") == $f and (.tier | test("T1")))] | length' \
+            "$post_map" 2>/dev/null || echo 0)
+          local r1_trigger
+          r1_trigger=$(awk -v pre="$r1_pre" -v post="$r1_post" \
+            'BEGIN { if (post >= 3 && post >= pre * 1.5) print "1"; else print "0" }')
+          [ "$r1_trigger" = "1" ] && r_hits="${r_hits}R1 pattern ${r1_post} hits (pre=${r1_pre}) "
 
-          # R2: retroactive_rollback 건수
+          # R2: retroactive_rollback 1건+ → 즉시 확증 (guide "R2 = Sonnet 오판 확정")
           local r2_count
           r2_count=$((pre_rb + post_rb))
           [ "$r2_count" -ge 1 ] && r_hits="${r_hits}R2 pattern ${r2_count} hits "
 
-          # R3: 동일 check 재발동 ≥4 사이클 내
-          local r3_count
-          r3_count=$((post_count))
-          [ "$r3_count" -ge 3 ] && r_hits="${r_hits}R3 pattern ${r3_count} hits"
+          # R3: 동일 check 재발동 ≥3 AND post ≥ pre*1.5
+          local r3_trigger
+          r3_trigger=$(awk -v pre="$pre_count" -v post="$post_count" \
+            'BEGIN { if (post >= 3 && post >= pre * 1.5) print "1"; else print "0" }')
+          [ "$r3_trigger" = "1" ] && r_hits="${r_hits}R3 pattern ${post_count} hits (pre=${pre_count})"
 
           [ -n "$r_hits" ] && delta_summary="${delta_summary} · ${r_hits}"
         fi
