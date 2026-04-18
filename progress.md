@@ -66,6 +66,37 @@ tags: [ruler, retrospective, progress]
 
 ## Working Notes (세션 간 전달)
 
+### 2026-04-18T09:01 KST NUDGE_1 (98% tok) — 비서 mute 메커니즘 구축 중 강제 compact
+
+**마지막 결정/발견**:
+- 원인 규명 완료 (이중): cloud workspace 계정 sticky (가설 B) + Windows 경로 cloud 인식 불가 + **비서 NUDGE 가 `/ultraplan` prompt 에 섞여 cloud 혼란** (4지선다 팝업 유발)
+- handoff.sh `REFINE_PROMPT` 를 GitHub URL 기반으로 재작성 완료 (`https://github.com/jsh8603-web/ruler/blob/main/plan.md`). cloud 가 자력 clone 해서 읽음 실증.
+- watch.js 에 API Error/Stream idle 감지 → textarea 자동 입력 + Enter 재시도 (3회 상한) + screenshot 저장 로직 추가.
+- 비서 mute 메커니즘 설계: flag `~/.claude/.secretary-mute/{session}` — handoff.sh touch, watch.js `process.on('exit')` cleanup, `psmux-send-helper.js sendSafe()` 진입부에 가드 1개 (모든 nudge/ctx-warn/escalation 차단).
+
+**미완 작업** (다음 세션 재개 시 여기서 계속):
+- ✅ `D:/projects/button/agent/secretary/psmux-send-helper.js`: mute 가드 추가 (L70 부근)
+- ✅ `~/.claude/scripts/ultraplan-handoff.sh`: mute flag touch 추가 (Ctrl+L pane clear 직전)
+- ✅ `~/.claude/scripts/ultraplan-watch.js`: `process.on('exit')` cleanup 추가 (main 시작부)
+- ⏸ watch.js screenshot 블록에 Edge fg 통합 (L240-273): `bringEdgeFg(page)` 헬퍼 만들어 `page.bringToFront() + PowerShell bring-edge-foreground.ps1` 순서로 호출 — **편집 도중 compact 도달, 재개 시 완료 필요**
+- ❌ **비서 재시작 필수** — psmux-send-helper.js 변경 반영 (재시작 절차 파악 필요)
+- ❌ 깨끗한 새 ultraplan 호출 테스트 (mute 반영 + fg screenshot 검증)
+
+**동기화 필요**:
+- Edge 창 사용자가 닫음 → 기존 cloud 세션 `session_01Uk1DjKyJFFyerfmrmJM92s` 은 cancel 처리. 재호출 시 새 session URL 생성
+- 사용자 구두 결정: "비서 일시정지하고 ultraplan 가동" / "캡처하라면 함수에 창 프론트 띄우기 추가" / "remote 복귀 시점에 비서 재가동"
+- 기각 대안: "다시봐줘 버튼 자동 클릭" — 사용자가 채팅창에 직접 입력한 텍스트였음. retry 는 오직 textarea input 방식.
+- watch.js screenshot 편집 중단점: L273 직후 (fg 통합 미완). L252/L267/L283 의 `await page.screenshot(...)` 세 곳 앞에 `await bringEdgeFg(page)` 호출 삽입 필요.
+
+**다음 의도** (우선순위):
+1. 압축 리줌 후 watch.js L240-290 범위 재개 — `bringEdgeFg` 헬퍼 추가
+2. 비서 재시작 방법 파악 (button agent 프로세스 재기동)
+3. 새 `/ultraplan refine` 재시도 (mute+fg+retry 전체 검증)
+4. cloud refine 결과 수신 → plan.md §7.2 L346/L390 중복, change-impact.py 잔존 references, §9 pre-separation 정리
+5. 그 후 Phase 3 → Step 1 (retrospective-guide.md 재작성) 진입
+
+---
+
 ### 2026-04-18T02:48 KST NUDGE_1 (102% tok) — 강제 compact 핸드셰이크
 
 - 직전 turn 에서 §7.2 Supervisor 잠정 판정 (Q1 bash통합 / Q2 4주 관찰 / Q3 R# 보조 1줄) plan.md 에 기록 완료. 사용자가 추가로 §부록 Code-Context-Packet 구조 수동 편집 (line 1-33 prepend) — 본 세션 분석 변경 없음, 이어받을 다음 세션이 §부록 인지하면 됨.
