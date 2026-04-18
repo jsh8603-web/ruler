@@ -54,6 +54,10 @@ tags: [ruler, retrospective, progress]
   - 건들지 말 것: Phase Final-A, 다른 Phase 정의, audit 트리거 조건.
   - 완료 판정: (a) grep `'Phase Final-B'` 주변 `'ruler Phase B'` 또는 `'Compliance'` 참조 매치 (b) "최근 7일 §0.5 누락 감사" 단일 소유자 표기 (ruler Phase B) 명시 문장 존재.
   - 사유 (opus): 두 skill 간 책임 경계 설계 = 역할 분담 + 추상화 계층 변경.
+  - **⚠️ 실행 조건 (§E 모델 전환 규칙 준수)**: 본 step 은 opus 재진입 필요. Step 1 (opus) → Step 2~5,7,8 (sonnet) 구간에서 메인 세션이 sonnet 으로 내려간 경우, Step 6 진입 시 아래 2경로 중 택1 — 동일 세션 내 `/model` 직접 전환 **금지** (§E 핑퐁/고비용):
+    - (a) **압축 직후 재진입**: 메인 세션이 `/compact` 로 누적 토큰 리셋된 직후 opus 로 전환해 수행. §E A (마지막 전환 이후 ≥20k 누적) + B (opus 세션 <180k) 양 조건 만족해야. `model-switch-and-send.sh {sess} opus "..."` 경유.
+    - (b) **Agent subagent 위임**: `Agent({ model: "opus", description: "audit-wf Phase Final-B 재정의", prompt: "..." })` 서브에이전트. cache_write 없음 → §E B 비용 이슈 회피, 독립 context. prompt 에 plan §5 #5 요약 + Step 1 산출물 경로 (`retrospective-guide.md` 해당 섹션) + 건들지 말 경계 전달 필수.
+    - **선택 기준**: 메인 세션 누적 <150k + compact 비용 ≤ subagent spawn 비용 → (a). 그 외 → (b).
 
 - [ ] **Step 7 — Smoke test + verdict 오탐 1차 리뷰** (model: sonnet)
   - 대상: Step 1-6 완료 후 수동 retrospective 1회.
@@ -62,9 +66,121 @@ tags: [ruler, retrospective, progress]
   - 완료 판정: ① 두 산출 md 파일 존재 ② verdict 최소 1건 GOOD 또는 BAD (전부 INSUFFICIENT 이면 window 재조정 필요 → pending) ③ 토큰 실측 기록 (Phase A+B 합산, plan §6.2 기준 100k 미만).
   - Sonnet-executable 5항목: (1) 경로 = 산출 md (2) 라인 N/A (검증 step) (3) before/after N/A (4) 경계 ✅ (5) 판정 ✅.
 
+- [ ] **Step 8 — `patrol-tier-c.md §C_external` 항목 추가** (model: sonnet)
+  - 파일: `D:/projects/ruler/.ruler/patrol-tier-c.md`
+  - 대상 섹션: Tier C 순찰 체크리스트 내 `§C_external` (없으면 신규 섹션 생성). 진입 전 `grep -n '^##\|^###\|C_external\|external-skill'` 로 삽입 위치 확정.
+  - 변경: §C_external 신규/보완 1항목 — `external-skill-checksums.md` 를 Tier C 30분 사이클에서 읽어 plan §5 외부 skill 2개 (ruler-wf, audit-wf) 의 sha256 을 실제 파일 해시와 대조. drift 감지 시 decisions.jsonl T1 entry append + log/{date}.md 기록. 구현 근거: plan §6.5.4 + §7.2 §6.5 보완.
+  - 건들지 말 것: 기존 §C_* 항목 (E*/C* 체크리스트), Tier C 사이클 주기 (30분), self-wake 로직.
+  - 완료 판정: grep `'§C_external\|external-skill-checksums'` 매치 + Tier C 본문 내 sha256 대조 절차 1줄 이상.
+  - Sonnet-executable 5항목: (1) 경로 ✅ (2) 라인 = grep 선행 (3) 변경 = "§C_external 섹션 추가 + checksum 대조 절차 1줄" (4) 경계 ✅ (5) 판정 grep ✅.
+  - 사유 (§7.2 §6.5 보완, Cost 권고 채택): 외부 skill 2개 drift 추적을 ruler patrol 에 통합 = 기계적 1-line append, model opus 불요.
+
 ---
 
 ## Working Notes (세션 간 전달)
+
+### 2026-04-18T10:02 KST NUDGE_4 — 사용자 1시간 부재 자율 진행
+
+**사용자 지시**: "완료되게 알아서 해놔 난 한시간동안 없다"
+
+**자율 진행 판단**:
+- 이전 handoff (pid 32176) = timeout 으로 fail (self-target race: 사용자 compact 메시지가 `/ultraplan refine` send-keys 와 충돌)
+- 사용자 1시간 부재 = race 없음 → handoff 재호출 안전
+- self-wake stop sentinel 유지 (기존 touch) → 다음 cycle (~147s) 에 graceful exit → handoff 와 wake message 간섭 없음
+- watch.js = 독립 프로세스. spawn 후 최대 60분 timeout 내 cloud refine 완료 자율 처리. 내 세션 개입 불필요
+
+**실행 순서 (본 NUDGE 작성 직후)**:
+1. 이 NUDGE_4 저장 (압축 내성)
+2. `bash ~/.claude/scripts/ultraplan-handoff.sh D:/projects/ruler/plan.md` 재호출 (background self-reinvoke)
+3. handoff 진행 중 사이 self-wake 는 stop 으로 수렴 → wake interference 없음
+4. 성공 시 watch.js spawn → cloud refine → approved → Implement here 자동 Enter → plan.md 갱신
+5. 내 세션 토큰 98% 근접 → 비서 mute 해제 상태라 COMPACT_READY 재echo 시 비서가 /compact 주입 가능 (단 handoff 가 다시 mute touch 하면 cycle 대기 필요)
+
+**사용자 복귀 시 체크리스트** (1시간 후):
+1. `tail -30 /tmp/ultraplan-handoff-self-*.log` — 최신 handoff 결과 확인
+2. `ls /tmp/ultraplan-screenshots/` — watch.js retry 이력
+3. `git log --oneline -5 D:/projects/ruler/plan.md` — plan.md 가 cloud refine 결과로 갱신됐는지
+4. `cat ~/.claude/.ultraplan-pending/btn-ruler 2>/dev/null` — 있으면 pending (미완), 없으면 완료 또는 미시작
+5. `ps -W | grep ultraplan-watch` — watch.js 아직 돌면 진행 중 (60분 timeout)
+6. `~/.claude/.secretary-mute/btn-ruler` 존재 여부 — handoff 실행 중이면 있음, 완료면 없음
+
+**완료 판정 + 복귀 경로** (2026-04-18T10:10 사용자 재확인: "1시간 자율 멈추지말고 ultraplan 제대로될때까지 계속. 정상 작동 확인되면 기존 플랜으로 복귀"):
+- **완료**: plan.md 가 cloud refine 결과로 updated (git log --since="15 min ago" --oneline plan.md 에 새 commit 또는 `<ultraplan>` injection) → `touch ~/.claude/.ultraplan-wake-stop` → self-wake v3 종료
+- **복귀**: stop 이후 즉시 **progress.md Step 1 진입** (retrospective-guide.md 재작성, model: opus — 이미 opus 세션이므로 추가 전환 불필요). Step 1 완료 판정은 §1~§4 재작성 + GOOD/NEUTRAL/BAD/INSUFFICIENT 스키마 + R1~R11 `§부록` 이동 grep 검증
+- **지속 retry**: handoff 실패 시 다음 wake (5분 후) gate pass 시 재호출. watch.js 60분 timeout 경우도 cycle 끝나면 gate 풀림 → 자동 재시도. 1시간 자율 범위 내 최대 12회 wake × 1회 handoff = 충분한 retry 공간
+- **실패 판정 (사용자 복귀 후 결정)**: 1시간 내 cloud refine 미완료 시 플랜 B (§7.2 Supervisor 잠정 판정 정식 채택) 로 전환 + Step 1 진입. 이 판정은 **사용자 복귀 후** 이므로 자율 구간 중엔 지속 retry 만 수행
+
+**⛔ 재확인 금지 사항**:
+- psmux kill-session 자발 호출
+- cloud dialog "Terminate session" / "Stop ultraplan" 자동 선택
+- 4지선다 dialog 등 판단 불명확 시 무단 선택
+- 상세: `~/.claude/memory/feedback_session_selfkill_forbidden.md`
+
+---
+
+### 2026-04-18T10:52 KST NUDGE_3 (98% tok) — 강제 compact 핸드셰이크
+
+**세션 진입 시 즉시 확인**:
+1. `ls -lt /tmp/ultraplan-screenshots/` — watch.js retry screenshot 확인
+2. `ps -W | grep -i ultraplan-watch` — watch.js 프로세스 생존 여부
+3. `cat ~/.claude/.ultraplan-wake-ts` — self-wake 루프 timestamp (fresh = 3분 이내)
+4. `ls /tmp/ultraplan-handoff-self-*.log | tail -1` — handoff 진행 로그
+5. `"$PSMUX" capture-pane -t btn-ruler -p | tail -30` — 현재 pane 상태
+
+**다음 의도 (압축 리줌 후 첫 행동)**:
+- 압축 후 내 턴 종료 → session idle → handoff.sh 가 Enter 송신 → `/ultraplan refine` 시작 → session URL 감지 → watch.js spawn
+- 3분 간격 self-wake 메시지 (btn-ruler → btn-ruler) 도착 시 위 5단계 상태확인 수행
+- watch.js 가 API Error 만나면 "계속해" 3회 자동 재시도 (v2 로버스트 코드: contenteditable 우선 + send-button click → input.press(Enter) → Ctrl+Enter fallback)
+- cloud `◆ approved` + Implement here Enter 처리 완료 시점에 `touch ~/.claude/.ultraplan-wake-stop` 으로 self-wake 루프 종료
+
+**⛔ 절대 금지 (이번 세션에서 새로 박은 규칙)**:
+- psmux kill-session 자발적 호출 금지
+- cloud dialog "Terminate session" / "Stop ultraplan" 옵션 자동 선택 금지
+- 판단 불명확한 dialog → 사용자에게 pane 상태 보고 후 대기
+- 상세: `~/.claude/memory/feedback_session_selfkill_forbidden.md`
+
+**이번 세션 변경 요약**:
+- `~/.claude/memory/feedback_session_selfkill_forbidden.md` 신규 (+ MEMORY.md 인덱스)
+- `~/.claude/scripts/ultraplan-watch.js` L247-304 재작성 (Enter submit 로버스트 + "계속해" 한국어 + 3회 retry 유지)
+- `ultraplan-handoff.sh` 호출 — self-target background, idle 대기 중, mute flag 재설정
+- self-wake 3분 루프 b0p3n2f2r background running, EXIT_PATTERN `^btn-ruler$`, stop sentinel `~/.claude/.ultraplan-wake-stop`
+- mute flag 는 handoff 가 touch, watch.js exit hook 이 unlink. stale 시 ruler Tier C 정리
+
+**동기화 필요**:
+- self-wake loop PID/shell task ID = `b0p3n2f2r` (사용자 승인 없이 kill 금지. 루프 자체는 stop file touch 로 graceful exit)
+- handoff-self-32176.log (또는 신규 pid) 가 session URL 감지 실패 시 fallback 6분 폴링 진입 → 수동 개입 필요
+- plan.md §7.2 Supervisor 잠정 판정 은 cloud refine 결과 수신 후 (가설 A) 덮어쓰기 또는 (가설 B) 정식 채택
+
+---
+
+### 2026-04-18T10:58 KST NUDGE_2 — Enter 버그 fix + "계속해" 교체 + 셀프킬 금지 feedback
+
+**이전 btn-ruler 세션 사고**:
+- `/ultraplan refine` 진행 중 "ultraplan input required" 4지선다 dialog → 에이전트가 Bash 로 Down+Enter 송신하여 "Stop ultraplan" → "Terminate session" 자동 선택 → **세션 셀프킬 + 34분+ cloud 맥락 소실**
+- 사용자 명시 금지: "세션 셀프킬은 명령어로 한것 같은데 절대 그렇게하면 안된다"
+- feedback 메모리 저장: `~/.claude/memory/feedback_session_selfkill_forbidden.md` (MEMORY.md 인덱스 추가)
+- 방지 규칙: psmux kill-session 자발 호출 금지 / cloud dialog "Terminate" "Stop" 옵션 자동 선택 금지 / watch.js 는 이미 "Implement here" (기본값 Enter) 외 액션 안 함 — 안전
+
+**watch.js 수정 (`~/.claude/scripts/ultraplan-watch.js` L247-304)**:
+- Enter 안 먹는 버그 = claude.ai ProseMirror `div[contenteditable=true]` 에 `keyboard.press('Enter')` 가 newline 삽입만 하고 submit 안 됨
+- fix: (a) `replyAreaSel` = contenteditable div 우선 + textarea fallback (b) 송신 3단계: send button click → input.press(Enter) → Ctrl+Enter fallback (c) 재시도 메시지 "please continue..." (영문) → **"계속해"** (한국어, 사용자 지시) (d) maxRetry=3 유지
+- syntax 검증 통과 (`node -c` OK)
+
+**mute flag cleanup**:
+- 이전 btn-ruler 비정상 종료로 `.secretary-mute/btn-ruler` stale 잔존 → 수동 rm 완료
+- watch.js `process.on('exit')` cleanup 은 정상 종료 시에만 작동. 셀프킬 경로에선 SIGKILL 받아서 unlink 못함 → ruler Tier C 정리 예정
+
+**다음 의도 (현 세션)**:
+1. `ultraplan-handoff.sh` 호출 (self-target background reinvoke) → cloud refine 재시작
+2. `self-wake.sh` 3분 루프 background spawn (btn-ruler 타겟) — watch.js 상태 확인 + 필요시 사용자 보고
+3. `◆ approved` dialog 처리 완료 시점에 `.watchdog-stop` touch 로 self-wake 루프 자동 종료
+
+**동기화 필요**:
+- progress.md 본 섹션 상단에 NUDGE_2 prepend 완료
+- watch.js 변경은 다음 호출부터 적용 (nohup node 새로 spawn)
+- 이전 NUDGE_1 의 watch.js fg 통합 / mute 가드 이미 반영됨 (실제 파일 verify 완료) — Working Notes 의 "⏸ 편집 도중 compact" 기록은 stale
+
+---
 
 ### 2026-04-18T09:01 KST NUDGE_1 (98% tok) — 비서 mute 메커니즘 구축 중 강제 compact
 
