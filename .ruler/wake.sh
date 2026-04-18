@@ -21,6 +21,10 @@ if [ -f .wake-ts ]; then
   fi
 fi
 
+# 2026-04-18: stale .wake-stop sentinel 자동 청소. 이전 lifecycle(idle-strike 3 등)
+# 이 찍은 sentinel 이 남아있으면 L50 감지로 31s 만에 자살 → 비서 재시작 + 자살 loop.
+rm -f .wake-stop
+
 echo "$(date +%s%3N)" > .wake-ts
 echo $$ > .wake-pid
 trap 'rm -f .wake-pid .wake-ts' EXIT
