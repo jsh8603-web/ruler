@@ -127,8 +127,10 @@ if [ -d "${RULER_DIR}/batch-plans/done" ]; then
 fi
 
 # 8. regression 이력 — log/{date}.md 내 grep
+# pipefail 환경에서 빈 log 디렉토리 → grep exit 1 → 파이프 실패 방어 ({ ... || true; })
 if [ -d "${RULER_DIR}/log" ]; then
-  grep -l "regression_" "${RULER_DIR}/log/"*.md 2>/dev/null | while IFS= read -r f; do
+  { grep -l "regression_" "${RULER_DIR}/log/"*.md 2>/dev/null || true; } | while IFS= read -r f; do
+    [ -z "$f" ] && continue
     append_entry "regression_log" "$f" "" "" "" "{}"
   done
 fi
@@ -191,11 +193,14 @@ PRE_WINDOW_JSON="{}"
 POST_WINDOW_JSON="{}"
 
 if [ -f "$DEC" ]; then
-  # T1/T2 entry 목록 추출 (ts, check, file 필드)
+  # T-point entry 목록 추출 — change event 원천 확장
+  # T1 (즉시 수정) + T2_batch_applied (batch 가 실제 적용한 T2) 만 T-point 로 간주.
+  # T2_user_direct / T2 (pending 상태) / T0 / archive 는 T-point 아님 (적용 이전 또는 비-change).
+  # tier 변종 (T1_user_auth 등) 은 test("^T1") 로 포섭 (substring 아닌 prefix).
   T_ENTRIES_FILE="${TMPDIR_WORK}/t_entries.json"
   jq -c 'select(
-    (.tier | test("T1|T2")) and
-    (.ts != null) and (.ts != "")
+    (((.tier // "") | test("^T1")) or ((.tier // "") == "T2_batch_applied"))
+    and (.ts != null) and (.ts != "")
   ) | {ts, check: (.check // "unknown"), file: (.file // "unknown")}' \
     "$DEC" 2>/dev/null | jq -s '.' > "$T_ENTRIES_FILE" 2>/dev/null || echo "[]" > "$T_ENTRIES_FILE"
 
@@ -313,6 +318,70 @@ MISSING_FILE="${TMPDIR_WORK}/missing.txt"
 echo "[retrospective-collect] §0.5 missing audit done ($(jq 'length' <<< "${MISSING_FILES_JSON}") missing)" >&2
 
 # ===========================================================================
+# [Step 3-2b] backfill_missing() — missing_files 각 건 decisions.jsonl append
+# ts: mtime+09:00, action:"backfill", original_absent:true
+# tier: T1 (rules/skills/hooks 매칭) or unknown
+# 중복 방지: 동일 file + original_absent:true entry 있으면 skip
+# ===========================================================================
+backfill_missing() {
+  local missing_count
+  missing_count=$(jq 'length' <<< "${MISSING_FILES_JSON}" 2>/dev/null || echo 0)
+  [ "${missing_count:-0}" -eq 0 ] && return 0
+
+  local backfilled=0 skipped=0
+  local mf_list
+  mf_list=$(jq -r '.[]' <<< "${MISSING_FILES_JSON}" 2>/dev/null)
+
+  while IFS= read -r mf; do
+    [ -z "$mf" ] && continue
+
+    # 중복 감사: 이미 동일 file + original_absent:true entry 가 decisions.jsonl 에 있으면 skip
+    if [ -f "$DEC" ]; then
+      local dup
+      dup=$(jq -c --arg f "$mf" \
+        'select((.file // "") == $f and (.original_absent // false) == true) | .ts' \
+        "$DEC" 2>/dev/null | head -1)
+      if [ -n "$dup" ]; then
+        skipped=$((skipped + 1))
+        continue
+      fi
+    fi
+
+    # mtime 확보 (파일이 삭제되었을 수도 있음 → fallback to now)
+    local mtime_epoch mtime_iso
+    if [ -e "$mf" ]; then
+      mtime_epoch=$(stat -c '%Y' "$mf" 2>/dev/null || date +%s)
+    else
+      mtime_epoch=$(date +%s)
+    fi
+    mtime_iso=$(date -u -d "@${mtime_epoch}" '+%Y-%m-%dT%H:%M:%S' 2>/dev/null)+09:00
+
+    # tier 추정: rules/skills/hooks 매칭 → T1, 외 → unknown
+    local tier
+    if echo "$mf" | grep -qE '/(rules|skills|hooks)/|\.ruler/'; then
+      tier="T1"
+    else
+      tier="unknown"
+    fi
+
+    # decisions.jsonl append
+    jq -cn --arg ts "$mtime_iso" \
+           --arg session "retrospective-collect" \
+           --arg file "$mf" \
+           --arg tier "$tier" \
+      '{ts: $ts, session: $session, file: $file,
+        action: "backfill", reason: "missing_audit_backfill",
+        original_absent: true, tier: $tier,
+        meta: {inferred_from: "mtime"}}' >> "$DEC"
+    backfilled=$((backfilled + 1))
+  done <<< "$mf_list"
+
+  echo "[retrospective-collect] backfill_missing done (backfilled=${backfilled} skipped=${skipped})" >&2
+}
+
+backfill_missing || echo "[retrospective-collect] WARN backfill_missing failed (best-effort)" >&2
+
+# ===========================================================================
 # [Step 3-3] compute_change_impact() — Verdict 계산 + md 표 렌더
 # 입력: pre/post window JSON + audit-log + secretary-state
 # 출력: .ruler/retrospective/{date}_change-impact.md
@@ -409,6 +478,72 @@ compute_change_impact() {
         '[.[] | .[] | select((.file // "") == $f and (.action == "retroactive_rollback" or .outcome == "rolled_back"))] | length' \
         "$post_map" 2>/dev/null || echo 0)
 
+      # audit-log ts 기반 pre/post ERROR + ESCALATION 카운트 (T_TS ±3.5d window)
+      # audit-log 파일은 "YYYY-MM-DD.jsonl" 일별 분리
+      local t_epoch t_pre_epoch t_post_epoch
+      t_epoch=$(date -u -d "$t_ts" +%s 2>/dev/null || echo 0)
+      t_pre_epoch=$((t_epoch - 302400))   # -3.5d (3.5*86400)
+      t_post_epoch=$((t_epoch + 302400))  # +3.5d
+      local t_pre_iso t_post_iso
+      t_pre_iso=$(date -u -d "@${t_pre_epoch}" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo "1970-01-01T00:00:00Z")
+      t_post_iso=$(date -u -d "@${t_post_epoch}" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo "9999-12-31T23:59:59Z")
+
+      local audit_err_pre=0 audit_err_post=0 esc_pre=0 esc_post=0
+      if [ -d "$AUDIT_LOG_DIR" ] && [ "$t_epoch" -gt 0 ]; then
+        # pre window (t_pre_iso ~ t_ts)
+        while IFS= read -r af; do
+          [ -z "$af" ] && continue
+          local ec
+          ec=$(awk -F'"' -v lo="$t_pre_iso" -v hi="$t_ts" '
+            /"type":"ERROR"/ {
+              ts=""
+              for (i=1;i<=NF;i++) if ($i=="ts") { ts=$(i+2); break }
+              if (ts >= lo && ts < hi) count++
+            }
+            END { print count+0 }
+          ' "$af" 2>/dev/null || echo 0)
+          audit_err_pre=$((audit_err_pre + ${ec:-0}))
+          local esc_c
+          esc_c=$(awk -F'"' -v lo="$t_pre_iso" -v hi="$t_ts" '
+            /"type":"escalation_warned"/ {
+              ts=""
+              for (i=1;i<=NF;i++) if ($i=="ts") { ts=$(i+2); break }
+              if (ts >= lo && ts < hi) count++
+            }
+            END { print count+0 }
+          ' "$af" 2>/dev/null || echo 0)
+          esc_pre=$((esc_pre + ${esc_c:-0}))
+        done < <(find "$AUDIT_LOG_DIR" -name "*.jsonl" -newermt "@${t_pre_epoch}" ! -newermt "@${t_epoch}" 2>/dev/null)
+
+        # post window (t_ts ~ t_post_iso)
+        while IFS= read -r af; do
+          [ -z "$af" ] && continue
+          local ec
+          ec=$(awk -F'"' -v lo="$t_ts" -v hi="$t_post_iso" '
+            /"type":"ERROR"/ {
+              ts=""
+              for (i=1;i<=NF;i++) if ($i=="ts") { ts=$(i+2); break }
+              if (ts > lo && ts <= hi) count++
+            }
+            END { print count+0 }
+          ' "$af" 2>/dev/null || echo 0)
+          audit_err_post=$((audit_err_post + ${ec:-0}))
+          local esc_c
+          esc_c=$(awk -F'"' -v lo="$t_ts" -v hi="$t_post_iso" '
+            /"type":"escalation_warned"/ {
+              ts=""
+              for (i=1;i<=NF;i++) if ($i=="ts") { ts=$(i+2); break }
+              if (ts > lo && ts <= hi) count++
+            }
+            END { print count+0 }
+          ' "$af" 2>/dev/null || echo 0)
+          esc_post=$((esc_post + ${esc_c:-0}))
+        done < <(find "$AUDIT_LOG_DIR" -name "*.jsonl" -newermt "@${t_epoch}" ! -newermt "@${t_post_epoch}" 2>/dev/null)
+      fi
+      local err_delta esc_delta
+      err_delta=$((audit_err_post - audit_err_pre))
+      esc_delta=$((esc_post - esc_pre))
+
       # original_absent:true → INSUFFICIENT 강제
       local orig_absent
       orig_absent=$(echo "$t_entry" | jq -r '.original_absent // false')
@@ -417,32 +552,40 @@ compute_change_impact() {
       if [ "$orig_absent" = "true" ]; then
         verdict="INSUFFICIENT"
         delta_summary="original_absent:true — pre/post 계산 불가"
-      elif [ "$pre_count" -lt 10 ]; then
+      elif [ "$pre_count" -lt 5 ]; then
+        # N<5 기준: Poisson 95% CI 하한 ~1.6. 초기 부트스트랩 기간 (T entry 희소) 에
+        # 대부분 INSUFFICIENT 가 되어 obs-only 해제 불가 문제 완화. N=10 → 5 로 낮춤.
         verdict="INSUFFICIENT"
-        delta_summary="N=${pre_count} < 10 (Poisson CI 하한 미달)"
+        delta_summary="N=${pre_count} < 5 (Poisson CI 하한 미달)"
       else
-        # 변화율 계산: post_count vs pre_count (에러/재발동 기준)
-        # GOOD: post ↓20%+ AND rollback 0
-        # BAD: post ↑20%+ OR rollback 발생 OR 재수정
-        # NEUTRAL: ±10% 이내
+        # 변화율 계산 + audit-log delta 반영
+        # GOOD: post ↓20%+ AND rollback 0 AND err_delta <= 0 AND esc_delta <= 0
+        # BAD:  post ↑20%+ OR rollback 발생 OR err_delta >= +3 OR esc_delta >= +5
+        # NEUTRAL: 그 외
         local verdict_code
         verdict_code=$(awk \
           -v pre="$pre_count" -v post="$post_count" \
           -v pre_rb="$pre_rb" -v post_rb="$post_rb" \
+          -v err_d="$err_delta" -v esc_d="$esc_delta" \
           'BEGIN {
             if (pre == 0) { print "NEUTRAL"; exit }
             delta = (post - pre) / pre
-            if (post_rb > 0) { print "BAD"; exit }
-            if (delta <= -0.20) { print "GOOD"; exit }
-            if (delta >= 0.20)  { print "BAD"; exit }
+            # BAD 우선 (하나라도 만족)
+            if (post_rb > 0)   { print "BAD"; exit }
+            if (delta >= 0.20) { print "BAD"; exit }
+            if (err_d >= 3)    { print "BAD"; exit }
+            if (esc_d >= 5)    { print "BAD"; exit }
+            # GOOD (모두 만족)
+            if (delta <= -0.20 && err_d <= 0 && esc_d <= 0) { print "GOOD"; exit }
             print "NEUTRAL"
           }')
         verdict="$verdict_code"
         delta_summary=$(awk \
           -v pre="$pre_count" -v post="$post_count" \
+          -v err_d="$err_delta" -v esc_d="$esc_delta" \
           'BEGIN {
-            if (pre == 0) { printf "pre=0 post=%d", post }
-            else { printf "재발동 pre=%d post=%d (Δ%.0f%%)", pre, post, (post-pre)/pre*100 }
+            if (pre == 0) { printf "pre=0 post=%d · err Δ%d·esc Δ%d", post, err_d, esc_d }
+            else { printf "재발동 pre=%d post=%d (Δ%.0f%%) · err Δ%d·esc Δ%d", pre, post, (post-pre)/pre*100, err_d, esc_d }
           }')
 
         # BAD 확증: §부록 R1~R11 쿼리 — guide 스펙 "pre 대비 +50% 이상이면 BAD 확정 보조 표기"
@@ -473,6 +616,32 @@ compute_change_impact() {
             'BEGIN { if (post >= 3 && post >= pre * 1.5) print "1"; else print "0" }')
           [ "$r3_trigger" = "1" ] && r_hits="${r_hits}R3 pattern ${post_count} hits (pre=${pre_count})"
 
+          # R4: post window 내 동일 파일 pending/dropped ≥5
+          local r4_count
+          r4_count=$(jq -r --arg f "$t_file" \
+            '[.[] | .[] | select((.file // "") == $f and (.action == "pending" or .action == "dropped"))] | length' \
+            "$post_map" 2>/dev/null || echo 0)
+          [ "$r4_count" -ge 5 ] && r_hits="${r_hits}R4 pattern ${r4_count} hits "
+
+          # R5: audit-log regression_failed post window (t_ts ~ t_post_iso) ≥1
+          local r5_count=0
+          if [ -d "$AUDIT_LOG_DIR" ] && [ "$t_epoch" -gt 0 ]; then
+            while IFS= read -r af; do
+              [ -z "$af" ] && continue
+              local rc
+              rc=$(awk -F'"' -v lo="$t_ts" -v hi="$t_post_iso" '
+                /"type":"regression_failed"/ {
+                  ts=""
+                  for (i=1;i<=NF;i++) if ($i=="ts") { ts=$(i+2); break }
+                  if (ts > lo && ts <= hi) count++
+                }
+                END { print count+0 }
+              ' "$af" 2>/dev/null || echo 0)
+              r5_count=$((r5_count + ${rc:-0}))
+            done < <(find "$AUDIT_LOG_DIR" -name "*.jsonl" -newermt "@${t_epoch}" ! -newermt "@${t_post_epoch}" 2>/dev/null)
+          fi
+          [ "$r5_count" -ge 1 ] && r_hits="${r_hits}R5 pattern ${r5_count} hits "
+
           [ -n "$r_hits" ] && delta_summary="${delta_summary} · ${r_hits}"
         fi
       fi
@@ -496,11 +665,12 @@ compute_change_impact() {
   fi
 
   # verdicts.txt 에서 집계
+  # awk 로 단일 pass 집계 — grep -c 의 Windows MSYS2 newline 섞임 회피
   if [ -f "${TMPDIR_WORK}/verdicts.txt" ]; then
-    cnt_good=$(grep -c "^GOOD$" "${TMPDIR_WORK}/verdicts.txt" 2>/dev/null || echo 0)
-    cnt_neutral=$(grep -c "^NEUTRAL$" "${TMPDIR_WORK}/verdicts.txt" 2>/dev/null || echo 0)
-    cnt_bad=$(grep -c "^BAD$" "${TMPDIR_WORK}/verdicts.txt" 2>/dev/null || echo 0)
-    cnt_insuf=$(grep -c "^INSUFFICIENT$" "${TMPDIR_WORK}/verdicts.txt" 2>/dev/null || echo 0)
+    cnt_good=$(awk '$0=="GOOD"{n++} END{print n+0}' "${TMPDIR_WORK}/verdicts.txt")
+    cnt_neutral=$(awk '$0=="NEUTRAL"{n++} END{print n+0}' "${TMPDIR_WORK}/verdicts.txt")
+    cnt_bad=$(awk '$0=="BAD"{n++} END{print n+0}' "${TMPDIR_WORK}/verdicts.txt")
+    cnt_insuf=$(awk '$0=="INSUFFICIENT"{n++} END{print n+0}' "${TMPDIR_WORK}/verdicts.txt")
   fi
 
   # md 파일 렌더링

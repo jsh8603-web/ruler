@@ -16,6 +16,49 @@
 
 set -u
 
+# jq PATH 보강 — Windows MSYS2 는 node-jq 경로만 있는 경우 대응
+if ! command -v jq >/dev/null 2>&1; then
+  JQ_NODE="/c/Users/jsh86/AppData/Roaming/npm/node_modules/node-jq/bin/jq.exe"
+  [ -x "$JQ_NODE" ] && export PATH="$(dirname "$JQ_NODE"):$PATH"
+fi
+
+# ── --validate-entry <json> 서브커맨드 (Step 13) ──
+# decisions.jsonl append 직전 필수 필드 {ts, file, action, tier} 검증.
+# file 키는 반드시 present — file:"" (archive/T0) 허용, 키 누락은 reject.
+# exit 0 = OK / exit 2 = field missing (stderr warn).
+if [ "${1:-}" = "--validate-entry" ]; then
+  _entry="${2:-}"
+  if [ -z "$_entry" ]; then
+    echo "[t1-gate] field missing: <empty entry>" >&2
+    exit 2
+  fi
+  if command -v jq >/dev/null 2>&1; then
+    if ! echo "$_entry" | jq -e 'has("ts") and has("file") and has("action") and has("tier") and (.ts != null) and (.action != null) and (.tier != null)' >/dev/null 2>&1; then
+      _missing=""
+      for k in ts file action tier; do
+        echo "$_entry" | jq -e "has(\"$k\")" >/dev/null 2>&1 || _missing="$_missing $k"
+      done
+      echo "[t1-gate] field missing:${_missing:- <null>}" >&2
+      exit 2
+    fi
+    # tier 값 형식 validation (T0|T1|T2|T3 + 서픽스 허용, archive/observe 허용)
+    _tier=$(echo "$_entry" | jq -r '.tier')
+    if ! echo "$_tier" | grep -qE '^(T[0-3](_[a-z_]+)?|archive|observe)$'; then
+      echo "[t1-gate] tier invalid: '$_tier' (허용: T0/T1/T2/T3 또는 _서픽스, archive, observe)" >&2
+      exit 2
+    fi
+  else
+    for k in ts file action tier; do
+      if ! echo "$_entry" | grep -qE "\"$k\"[[:space:]]*:"; then
+        echo "[t1-gate] field missing: $k" >&2
+        exit 2
+      fi
+    done
+  fi
+  echo "[t1-gate] validate-entry OK" >&2
+  exit 0
+fi
+
 FILE="${1:-}"
 NEW="${2:-}"
 shift 2 2>/dev/null || true
@@ -149,3 +192,105 @@ fi
 
 echo "[t1-gate] FAIL reasons=${REASON_STR}" >&2
 exit 1
+
+# ── verify_rollback() helper ─────────────────────────────────────────────
+# t1-gate.sh 본체는 "적용 전 Gate" 로 rollback 자체를 수행하지 않는다.
+# 하지만 Ruler patrol / batch 가 .bak 기반 rollback 을 수행한 직후 "복구가
+# 실제로 먹혔는지" verify 하는 헬퍼가 필요 — 실패 시 audit-log 에
+# type:"regression_failed" 이벤트를 append 해서 retrospective-collect.sh
+# Step 6 R5 pattern 이 집계할 수 있게 한다.
+#
+# 사용법 (caller 가 source 후 호출):
+#   source ~/.claude/.ruler/scripts/t1-gate.sh 2>/dev/null || true
+#   verify_rollback "<target_file>" "<expected_marker_or_hash>" "<reason_if_fail>"
+#
+# expected 파라미터 해석:
+#   - 64-char hex   → sha256 hash 로 간주, sha256sum 비교
+#   - 그 외 문자열   → file 에 반드시 존재해야 할 marker (grep -qF)
+# 양쪽 다 생략 시 = 단순 파일 존재 체크만 수행.
+#
+# 반환: 0 = OK, 1 = regression (audit-log 기록됨)
+verify_rollback() {
+  local target_file="${1:-}"
+  local expected="${2:-}"
+  local reason="${3:-rollback-verify-failed}"
+  local ok=1
+
+  if [ -z "$target_file" ] || [ ! -f "$target_file" ]; then
+    ok=0
+    reason="${reason}:file-missing"
+  elif [ -n "$expected" ]; then
+    if echo "$expected" | grep -qE '^[0-9a-f]{64}$'; then
+      local actual
+      actual=$(sha256sum "$target_file" 2>/dev/null | awk '{print $1}')
+      [ "$actual" = "$expected" ] || { ok=0; reason="${reason}:hash-mismatch"; }
+    else
+      grep -qF -- "$expected" "$target_file" 2>/dev/null || { ok=0; reason="${reason}:marker-absent"; }
+    fi
+  fi
+
+  if [ "$ok" -ne 1 ]; then
+    local AUDIT_DIR="${HOME}/.claude/audit-log"
+    mkdir -p "$AUDIT_DIR"
+    local AUDIT_FILE="${AUDIT_DIR}/$(date +%Y-%m-%d).jsonl"
+    local TS
+    TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    printf '{"ts":"%s","type":"regression_failed","file":"%s","reason":"%s","session":"%s"}\n' \
+      "$TS" "$target_file" "$reason" "${PSMUX_SESSION:-unknown}" >> "$AUDIT_FILE"
+    echo "[t1-gate:verify_rollback] FAIL file=$target_file reason=$reason (audit-log appended)" >&2
+    return 1
+  fi
+  return 0
+}
+
+# Placeholder usage (caller pattern — do not execute on direct invocation):
+#   cp "$target.bak" "$target"
+#   verify_rollback "$target" "$expected_marker" "post-t1-rollback" || {
+#     # audit-log already has regression_failed event; escalate as needed
+#     return 1
+#   }
+
+# ── validate_entry() helper (Step 13) ───────────────────────────────────
+# decisions.jsonl 에 append 하기 직전 entry 의 필수 필드 검증.
+# 호출 패턴 (caller 가 source 후 사용):
+#   source ~/.claude/.ruler/scripts/t1-gate.sh 2>/dev/null || true
+#   entry='{"ts":"...","file":"...","action":"edit","tier":"T1","reason":"..."}'
+#   validate_entry "$entry" || { echo "skip append" >&2; exit 2; }
+#   echo "$entry" >> ~/.claude/.ruler/decisions.jsonl
+#
+# 필수 키: ts, file, action, tier — file 은 "" 허용 but 키는 반드시 present.
+# 반환: 0 = OK, 2 = field missing (stderr warn).
+validate_entry() {
+  local entry="${1:-}"
+  if [ -z "$entry" ]; then
+    echo "[t1-gate] field missing: <empty entry>" >&2
+    return 2
+  fi
+  if command -v jq >/dev/null 2>&1; then
+    if ! echo "$entry" | jq -e 'has("ts") and has("file") and has("action") and has("tier") and (.ts != null) and (.action != null) and (.tier != null)' >/dev/null 2>&1; then
+      local missing=""
+      local k
+      for k in ts file action tier; do
+        echo "$entry" | jq -e "has(\"$k\")" >/dev/null 2>&1 || missing="$missing $k"
+      done
+      echo "[t1-gate] field missing:${missing:- <null>}" >&2
+      return 2
+    fi
+    # tier 값 형식 validation
+    local _tier
+    _tier=$(echo "$entry" | jq -r '.tier')
+    if ! echo "$_tier" | grep -qE '^(T[0-3](_[a-z_]+)?|archive|observe)$'; then
+      echo "[t1-gate] tier invalid: '$_tier' (허용: T0/T1/T2/T3 또는 _서픽스, archive, observe)" >&2
+      return 2
+    fi
+  else
+    local k
+    for k in ts file action tier; do
+      if ! echo "$entry" | grep -qE "\"$k\"[[:space:]]*:"; then
+        echo "[t1-gate] field missing: $k" >&2
+        return 2
+      fi
+    done
+  fi
+  return 0
+}

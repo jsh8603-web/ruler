@@ -50,7 +50,7 @@ export PATH="/c/Program Files/nodejs:$PATH"
    - `sendWithFile`: ruler-notify.sh 경유
    - `log_only`: `.ruler/log/{date}.md` 1줄 + decisions.jsonl 기록
    - `auto_fix`: `flag_stale_detected` 만 v1 허용 (rm+backup)
-5. **T1/T2 분류**: [`~/.claude/.ruler/violation-tier-criteria.md`](~/.claude/.ruler/violation-tier-criteria.md) 참조
+5. **T1/T2 분류**: [`~/.claude/.ruler/violation-tier-criteria.md`](~/.claude/.ruler/violation-tier-criteria.md) 참조 (→ criteria §T1 확장 (2026-04-18) — frontmatter/오탈자/dead-link 포함)
 6. 3단 기록 (decisions.jsonl + log + MEMORY ckpt 필요 시)
 
 ### 이벤트 규칙 SSOT

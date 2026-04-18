@@ -217,14 +217,14 @@ bash ~/.claude/.ruler/scripts/spawn-batch-session.sh "$PLAN_FILE"
 
 ### 입력
 
-- `decisions.jsonl` 7일치 T1/T2 entry (스키마: `ts/check/tier/file/outcome/phase`)
+- `decisions.jsonl` 7일치 **T1** entry (스키마: `ts/check/tier/file/outcome/phase`). T2 는 T-point 미사용 — pending batch 처리는 change event 가 아니며, 동일 (file,check) T2 다수 시 pre/post window 중복 계산됨.
 - Δ 관찰 소스 (T 시점 전후 각 **3.5일** window, T-file 단위 분리):
   - `decisions.jsonl` 동일 `check` + 동일 `file` 재발동 건수
   - `retroactive_rollback` / `outcome:"rolled_back"` 발생
   - `~/.claude/audit-log/{date}.jsonl` hook 실행 실패 / guard 차단 빈도
   - `D:/projects/button/agent/.secretary/.secretary-state.json` + escalation 카운터
 
-### 처리 (per T1/T2 entry)
+### 처리 (per T1 entry)
 
 1. T 시점 식별 (`ts` 필드)
 2. Pre-Δ (T-3.5d ~ T) 지표 snapshot
@@ -322,18 +322,15 @@ comm -23 /tmp/retro-actual.txt /tmp/retro-recorded.txt \
 
 **Phase A 재평가**: `original_absent:true` entry 는 위 Verdict 스키마에서 **INSUFFICIENT 강제** (pre/post Δ 계산 불가).
 
-### Step 3 — Patrol 규칙 동기화 (LLM 의미 비교, 범위 축소)
+### Step 3 — Patrol 규칙 동기화 (필수 체크리스트)
 
-**진입 조건**: Step 2 backfill 건 중 파일명이 `patrol*` / `event-rules*` / `rules/*.md` 연관인 경우만. (실측 기준: 누락 30건 중 patrol 연관 5-10건 예상 → LLM 호출 1/3-1/6 수준)
+Step 2 backfill 직후 진입. 산문형 "수행 권장" 을 **체크리스트** 로 승격해 skip 시에도 기록이 남도록 강제한다. Python/bash 중 편한 도구로 수행하되 **매 항목의 결과는 반드시 decisions.jsonl 에 흔적을 남긴다** (도구 중립, 기록 의무는 고정).
 
-**비교**: 변경된 규칙/코드 의미 vs `patrol.md` / `patrol-tier-*.md` / `event-rules.yaml` 감지 기준.
-
-**판정**:
-- **T1 즉시**: 정면 충돌 → patrol Edit + 별도 decisions.jsonl entry (`tier:"T1"`, `reason:"patrol drift sync"`)
-- **T2 pending**: drift 하지만 오탐만 → `pending/patrol-sync-{id}.md`
-- **clean**: 정합 유지
-
-**결정론성 메타**: LLM 호출 시 프롬프트 해시 + 응답 해시를 decisions.jsonl `meta: {prompt_hash, response_hash}` 에 기록. 3주 누적 후 같은 (파일, 규칙) 쌍에 대한 판정 일관성 메타 리포트.
+- [ ] `missing_files` 중 `patrol*` / `event-rules*` / `rules/*.md` 패턴 매칭 건 필터
+- [ ] 매칭 0건이면 decisions.jsonl 에 `{phase_b_step3:"skipped", reason:"no_patrol_related_missing"}` append **후 skip 강제** (기록 없이 생략 금지)
+- [ ] 각 매칭 건에 대해 LLM 의미 비교 질의 (프롬프트/응답 해시를 `meta:{prompt_hash, response_hash}` 에 기록)
+- [ ] 판정별 산출: **T1 즉시** → patrol Edit + 별도 decisions.jsonl entry / **T2** → `pending/patrol-sync-{id}.md` 생성 / **clean** → 무처리
+- [ ] 실행 요약을 decisions.jsonl 에 `{phase_b_step3:"done", t1:N, t2:M, clean:K}` 1줄 append (실행 요약 append 의무)
 
 ### 출력 — `.ruler/retrospective/{YYYY-MM-DD}_compliance.md`
 
@@ -384,6 +381,17 @@ comm -23 /tmp/retro-actual.txt /tmp/retro-recorded.txt \
 
 decisions.jsonl `phase_c:false, skip_reason:"B1=N B2=N ..."`. **Phase Final 은 생략하지 않음**.
 
+### Batch log 자동 append (무조건 실행, Step 13)
+
+**무조건 실행**: self-terminate 직전 `log/$(date +%Y-%m-%d).md` 에 batch 블록 1회 append. skip 불가. Phase C 가 skip 된 세션도 이 append 는 수행한다 (감사 트레이스 끊김 방지 — 과거 배치 세션 ~80% 가 log/ 미기록이었던 문제 해소).
+
+```bash
+echo -e "\n### [ruler-batch-${SESSION}] $(date +%H:%M) — Phase C completed\n- ..." \
+  >> "${HOME}/.claude/.ruler/log/$(date +%Y-%m-%d).md"
+```
+
+실제 append 시 `- ...` 는 해당 세션의 주요 결정/처리 요약 1-3줄로 대체한다 (예: `- phase_c:false skip_reason:"..."` / `- T2 pending 3건 resolve` / `- preflight rule R{N} 승격`).
+
 ---
 
 ## Phase Final — Hook SSOT Sync [유지, 무조건]
@@ -432,6 +440,54 @@ generated_by: ruler-batch-{ts}
 ### state.md 갱신
 
 `last_retrospective_ts`, `last_audit_wf_ts` (Phase C 실행 시), `promotion_log_last_count`, `memory_index_last_count` 갱신.
+
+### obs-only 해제 판정 (2026-05-16 이후 자동, G8)
+
+Observation-only 기간 (`state.md[change_impact_enforcement_start]` 기준) 이 만료 임박/도달했는지 판단하고 enforcement 를 자동 활성화하거나 연장한다. `### 완료 처리 → self-terminate` 직전에 **매 Phase Terminal 마다 수행** (today 가 start 이전이어도 누적 rate 는 계산만 해서 `decisions.jsonl` 에 snapshot 으로 append — 의사결정 발동은 start 도달 시만).
+
+**임계값 근거 (opus)**: 0.5 는 "표본 신뢰 하한". `INSUFFICIENT` 는 change-impact.md 에서 `pre=0 AND audit_err_pre=0` (데이터 부족) 으로 붙는 verdict 이므로, 누적 집계의 절반 이상이 INSUFFICIENT 라는 건 Primary 판정식이 돌아갈 수 있는 T 시점 자체가 모자란다는 뜻. N<10 으로 표본 부족 판정이 절반 이상이면 집계 자체를 신뢰할 수 없으므로 데이터 확보 기간 **+14d 연장**이 안전. 0.5 미만이면 NEUTRAL/GOOD/BAD 가 과반 → verdict 식이 실질 신호를 내고 있으므로 enforcement 활성화로 진행.
+
+**5-step 판정 절차**:
+
+1. **누적 `INSUFFICIENT` 비율 계산**:
+   ```bash
+   # .ruler/retrospective/*_change-impact.md 에서 verdict 칼럼 등장 빈도 추출 (현재 retrospective 포함)
+   cnt_good=$(cat ~/.claude/.ruler/retrospective/*_change-impact.md 2>/dev/null | grep -c '^| GOOD')
+   cnt_neutral=$(cat ~/.claude/.ruler/retrospective/*_change-impact.md 2>/dev/null | grep -c '^| NEUTRAL')
+   cnt_bad=$(cat ~/.claude/.ruler/retrospective/*_change-impact.md 2>/dev/null | grep -c '^| BAD')
+   cnt_insuf=$(cat ~/.claude/.ruler/retrospective/*_change-impact.md 2>/dev/null | grep -c '^| INSUFFICIENT')
+   total=$((cnt_good + cnt_neutral + cnt_bad + cnt_insuf))
+   # 0 나눗셈 가드: total=0 이면 rate=1.0 로 강제 → 연장 경로로 진입
+   [ "$total" -eq 0 ] && rate="1.000" || \
+     rate=$(awk -v i="$cnt_insuf" -v t="$total" 'BEGIN{printf "%.3f", i/t}')
+   today_ymd=$(date +%Y-%m-%d)
+   ```
+   `insufficient_rate = cnt_insuf / (cnt_good + cnt_neutral + cnt_bad + cnt_insuf)`.
+
+2. **해제 후보 판정**: `insufficient_rate < 0.5` → 해제 후보 (Step 3 경로). 이상이면 연장 경로 (Step 4).
+
+3. **해제 경로 (Step 2 YES)**: `state.md` 의 `change_impact_enforcement_start:` 필드를 `today_ymd` 로 override 설정 (즉시 enforcement 활성화). 원래 값이 미래 날짜였어도 당겨짐 — "데이터가 신뢰 가능하므로 obs 기간 단축"이 의도. promotion-log KNOWLEDGE append: `"Ruler obs-only 해제, N=${total} insufficient_rate=${rate}, enforcement start → ${today_ymd}"`. `new_start = today_ymd` 로 Step 5 에 넘긴다.
+
+4. **연장 경로 (Step 2 NO, `insufficient_rate >= 0.5`)**: `state.md` 의 `change_impact_enforcement_start:` 를 `(current value) + 14d` 로 재기록 (bash: `date -d "${cur} + 14 days" +%Y-%m-%d`). promotion-log KNOWLEDGE append: `"Ruler obs-only +14d 연장, N=${total} insufficient_rate=${rate}, enforcement start ${cur} → ${new_start}"`. 14d 선택 이유: 2 retrospective cycle (7d × 2) 동안 추가 표본 확보 → 다음 Phase Terminal 에서 재판정. `new_start = cur + 14d` 를 Step 5 에 넘긴다.
+
+5. **`decisions.jsonl` snapshot append (무조건, 해제/연장 어느 경로든 1줄)**:
+   ```bash
+   decision="released"   # Step 3 경로면 "released", Step 4 경로면 "extended"
+   # new_start 는 Step 3 또는 Step 4 에서 세팅된 값
+   jq -cn --arg ts "$(date +%Y-%m-%dT%H:%M:%S+09:00)" \
+          --arg sess "$PSMUX_SESSION" \
+          --arg dec "$decision" \
+          --argjson rate "$rate" \
+          --arg ns "$new_start" \
+     '{ts:$ts, session:$sess, file:".ruler/state.md", action:"obs_only_judgment",
+       phase_terminal_obs_decision:$dec, rate:$rate, new_start:$ns,
+       tier:"T1", outcome:"applied"}' \
+     >> ~/.claude/.ruler/decisions.jsonl
+   ```
+
+**Skip 조건**: `state.md` 에 `change_impact_enforcement_start` 필드가 이미 없다 (=obs-only 이미 해제 완료) → Step 1-5 전체 skip + decisions.jsonl `{phase_terminal_obs_decision:"already_released", rate:null, new_start:null}` 1줄만 append.
+
+**사용자 개입 0 원칙**: 판정·기록 모두 batch 세션 Opus 가 자동 수행. 사용자 승인 대기 금지 (§Self-Terminate Protocol 준수).
 
 ### 완료 처리 → self-terminate (§0 Self-Terminate Protocol)
 

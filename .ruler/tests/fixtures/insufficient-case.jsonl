@@ -1,0 +1,3 @@
+{"ts":"2026-04-08T11:30:00+09:00","session":"btn-A","file":"test/insufficient.md","action":"edit","reason":"pre re-trigger 1","check":"rule_insuf","tier":"T3","outcome":"applied"}
+{"ts":"2026-04-09T09:00:00+09:00","session":"btn-B","file":"test/insufficient.md","action":"edit","reason":"pre re-trigger 2","check":"rule_insuf","tier":"T3","outcome":"applied"}
+{"ts":"2026-04-09T12:00:00+09:00","session":"btn-T","file":"test/insufficient.md","action":"edit","reason":"T point intervention","check":"rule_insuf","tier":"T1","outcome":"applied"}

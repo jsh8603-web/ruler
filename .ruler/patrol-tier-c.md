@@ -52,8 +52,8 @@ tags: [ruler, patrol, tier-c, checklist]
 - **검사**: 첫 5줄 `---` frontmatter + `tags:` 필드 (필수). `date:` 권장 (기존 파일 grandfather)
 - **VaultVoice 추가 검증** (v6): `99_vaultvoice/` 경로 또는 vaultvoice 태그 파일 → `title:`, `aliases:` 필드 존재 필수 (vaultvoice.md §frontmatter 필수)
 - **조치**:
-  - `tags:` 누락 → T2 자동 주입 (기본값=폴더명)
-  - `date:` 누락 (mtime > 2026-04-14T10:30Z 신규 파일만) → T2 자동 주입
+  - `tags:` 누락 → **T1 자동 주입** (→ criteria §T1 확장 (2026-04-18), 기본값=폴더명, 1사이클 5건 상한)
+  - `date:` 누락 (mtime > 2026-04-14T10:30Z 신규 파일만) → **T1 자동 주입** (→ criteria §T1 확장)
   - VaultVoice `title:`/`aliases:` 누락 → T2 pending (피드에서 파일명이 제목으로 표시됨)
 - **판정 모드**: sonnet-decide
 
