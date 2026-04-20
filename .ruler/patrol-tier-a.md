@@ -106,12 +106,14 @@ export PATH="/c/Program Files/nodejs:$PATH"
   3. 남은 watched 세션 `capture-pane -S -30` 으로 현재 status 확인
   4. WORKING 하나라도 → `.idle-strike` 0 리셋
   5. 전원 non-WORKING → `.idle-strike` +1
-  6. `.idle-strike >= 3` 도달: (SSOT: wake.sh idle_strike_threshold=3, 2026-04-16 5→3 복원)
-     - `rm -f .active`
-     - `echo 0 > .idle-strike`
-     - `touch .wake-stop` (wake.sh 자가 중지 sentinel)
-     - state.md `idle_strike_count: 0` 갱신
-     - `log/{date}.md` 기록
+  6. 2단계 threshold (2026-04-20 I6 fix, SSOT: state.md idle_strike_threshold=5 + secretary.js L1560-L1635):
+     - `.idle-strike == 3` 도달: batch 소환 위임 (secretary 가 pending>=10 시 ruler-batch-* spawn). ruler patrol 은 이 단계에서 아무 조치 안 함 — wake-stop 찍지 말 것. strike 는 계속 +1 누적.
+     - `.idle-strike >= 5` 도달:
+       - `rm -f .active`
+       - `touch .wake-stop` (wake.sh 자가 중지 sentinel)
+       - state.md `idle_strike_count: <val>` 갱신 (리셋 X — WORKING 재감지 시 자연 리셋)
+       - `log/{date}.md` 기록
+     - 참고: 이전 "2026-04-16 5→3 복원" 주석은 misleading (실제로는 5→3 drift). 설계 원안 5 유지.
   7. 사이클 요약에 `strike={n}, working={k}/{total}` 포함
 - **판정 모드**: sonnet-decide
 - **자동수정 티어**: T1
