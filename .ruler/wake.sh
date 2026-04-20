@@ -121,7 +121,7 @@ while true; do
   # .active 없음 + watched WORKING 1개 이상 감지 시 level 로 .active 생성.
   if [ ! -f .active ] && [ "$_just_consumed" -eq 0 ]; then
     for _S in $("$PSMUX" ls 2>/dev/null | cut -d: -f1); do
-      case "$_S" in ruler|ruler-batch-*|task|schedule|secretary|worker|verifier|healer|strategic|btn-button) continue;; esac
+      case "$_S" in ruler|ruler-batch-*|task|schedule|secretary|worker|verifier|healer|strategic|btn-ruler) continue;; esac
       _CAP=$("$PSMUX" capture-pane -p -S -5 -t "$_S" 2>/dev/null)
       if echo "$_CAP" | grep -qE 'esc to interrupt|✽|Running…|Running\.\.\.|tokens.*esc'; then
         touch .active
@@ -175,7 +175,10 @@ while true; do
    (10사이클마다 Tier C: C3~C15 + C18-lite + C_memory)
 5. 자동수정 Gate: T1 즉시 적용, T2 pending 24h
 6. state.md 갱신 + log append
-7. 자기감시: patrol.md/skill.md 자기수정 금지 또는 T3 강제"
+7. 자기감시: patrol.md/skill.md 자기수정 금지 또는 T3 강제
+8. 보고 (§9 양식 준수, 반드시 1줄, cycle 번호는 wake.sh 전달값 ${CYCLE} 그대로 사용):
+   [cycle ${CYCLE}] HH:MM KST | candidates N (FP X%) | pending N/T urgent N/T | idle-strike N/3 | batch: YES/NO
+   이상 발생 시 해당 확장필드만 추가 (violation:/T1:/T2:/batch: SPAWN). \"C1 SAME\" 등 축약 금지."
 
   "$PSMUX" send-keys -t "$SESSION" "$MSG"
   sleep 1

@@ -102,7 +102,7 @@ export PATH="/c/Program Files/nodejs:$PATH"
 - **목적**: Watched 세션 전원 non-WORKING 이면 ruler 스스로 idle 로 진입
 - **절차**:
   1. `.session-registry.txt` Read
-  2. 제외 필터: `^(worker|verifier|healer|strategic|ruler)$` / `ruler-batch-` / `task|schedule|secretary` 접두사 / `btn-button` / `runner=gemini|codex`
+  2. 제외 필터: `^(worker|verifier|healer|strategic|ruler)$` / `ruler-batch-` / `task|schedule|secretary` 접두사 / `btn-ruler` / `runner=gemini|codex`
   3. 남은 watched 세션 `capture-pane -S -30` 으로 현재 status 확인
   4. WORKING 하나라도 → `.idle-strike` 0 리셋
   5. 전원 non-WORKING → `.idle-strike` +1
