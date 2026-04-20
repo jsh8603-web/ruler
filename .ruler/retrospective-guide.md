@@ -59,7 +59,8 @@ echo '{"ts":"'$(date -Iseconds)'","action":"retrospective_executed",...}' >> ~/.
 mv ~/.claude/.ruler/retrospective/{date}_plan.md ~/.claude/.ruler/retrospective/done/
 
 # 4. ruler 세션에 종료 신호
-psmux send-keys -t ruler '[ruler-wf-end] batch='$PSMUX_SESSION' rules_applied=N promoted=N' Enter
+source "$HOME/.claude/scripts/lib/psmux-send.sh"
+psmux_send_message ruler "[ruler-wf-end] batch=$PSMUX_SESSION rules_applied=N promoted=N"
 
 # 5. 자가 kill (secretary 레지스트리 자동 정리됨)
 psmux kill-session -t $PSMUX_SESSION

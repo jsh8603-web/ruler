@@ -39,6 +39,9 @@ if [ -z "$PSMUX" ] || [ ! -f "$PSMUX" ]; then
   exit 1
 fi
 
+# SSOT psmux helper (PSMUX_BIN 으로 bridge)
+PSMUX_BIN="$PSMUX" source "$HOME/.claude/scripts/lib/psmux-send.sh"
+
 # ruler 세션 단수성 강제: 이미 존재하면 스크립트 자체가 early-exit.
 # WF 쪽 재진입 프로토콜 (kill 금지, 컨텍스트만 주입) 과는 별개의 안전망이며,
 # 실수로 `spawn-session.sh ruler` 가 두 번 호출돼도 기존 세션이 훼손되지 않도록 보장한다.
@@ -178,7 +181,9 @@ THINK_ENV=""
 if [ -n "$THINK" ]; then
   THINK_ENV="set MAX_THINKING_TOKENS=${THINK} && "
 fi
+# psmux-raw-ok: bootstrap (cmd.exe pane before Claude launches)
 "$PSMUX" send-keys -t "$SESSION" "cd /d ${WIN_PROJECT_DIR}" Enter
+# psmux-raw-ok: bootstrap (cmd.exe pane — claude launch command)
 "$PSMUX" send-keys -t "$SESSION" "set PSMUX_SESSION=${SESSION} && ${THINK_ENV}claude --dangerously-skip-permissions --model ${MODEL} --system-prompt \"${SYSTEM_PROMPT}\"" Enter
 
 echo "[spawn:${SESSION}] Claude spawning..."
@@ -213,25 +218,25 @@ for i in $(seq 1 75); do
     # capture-pane 공백 제거 이슈 때문에 PANE_NS 로 grep 한다 ("Yes,Itrust" / "No,exit").
     CURSOR_LINE=$(echo "$PANE_NS" | grep "❯" | head -1)
     if echo "$CURSOR_LINE" | grep -qi "yes"; then
-      "$PSMUX" send-keys -t "$SESSION" Enter
+      psmux_send_key "$SESSION" Enter
       echo "[spawn:${SESSION}] Trust folder: cursor on Yes → Enter"
     elif echo "$CURSOR_LINE" | grep -qi "no"; then
       # Yes 줄이 No 줄보다 위/아래 어디에 있는지 계산 → Up/Down 결정
       YES_LINE=$(echo "$PANE_NS" | grep -in "yes,itrust\|yes.*trust" | head -1 | cut -d: -f1)
       NO_LINE=$(echo "$PANE_NS" | grep -in "no,exit\|no.*exit" | head -1 | cut -d: -f1)
       if [ -n "$YES_LINE" ] && [ -n "$NO_LINE" ] && [ "$YES_LINE" -lt "$NO_LINE" ]; then
-        "$PSMUX" send-keys -t "$SESSION" Up
+        psmux_send_key "$SESSION" Up
       else
-        "$PSMUX" send-keys -t "$SESSION" Down
+        psmux_send_key "$SESSION" Down
       fi
       sleep 1
-      "$PSMUX" send-keys -t "$SESSION" Enter
+      psmux_send_key "$SESSION" Enter
       echo "[spawn:${SESSION}] Trust folder: cursor on No → moved → Enter"
     else
       # 커서 마커 감지 실패 — 첫 줄이 Yes 인 것이 일반적이므로 Up+Enter
-      "$PSMUX" send-keys -t "$SESSION" Up
+      psmux_send_key "$SESSION" Up
       sleep 1
-      "$PSMUX" send-keys -t "$SESSION" Enter
+      psmux_send_key "$SESSION" Enter
       echo "[spawn:${SESSION}] Trust folder: cursor not detected → Up+Enter fallback"
     fi
     TRUST_HANDLED=true
@@ -248,7 +253,7 @@ sleep 2
 
 # ── 6. 핸드셰이크 전송 ──
 echo "[spawn:${SESSION}] Sending handshake..."
-"$PSMUX" send-keys -t "$SESSION" "HANDSHAKE: Bash 도구로 다음 명령 실행: echo '${SESSION}_ACK' >> ${WIN_PROJECT_DIR_SLASH}/.harness/acks.txt" Enter
+psmux_send_message "$SESSION" "HANDSHAKE: Bash 도구로 다음 명령 실행: echo '${SESSION}_ACK' >> ${WIN_PROJECT_DIR_SLASH}/.harness/acks.txt"
 
 # ── 7. ACK 폴링 (최대 60초) ──
 ACK_OK=false
@@ -264,7 +269,7 @@ done
 if [ "$ACK_OK" = false ]; then
   echo "[spawn:${SESSION}] WARNING: ACK not received after 60s — retry once" >&2
   # 재시도 1회
-  "$PSMUX" send-keys -t "$SESSION" "HANDSHAKE 재시도: Bash 도구로 실행: echo '${SESSION}_ACK' >> ${WIN_PROJECT_DIR_SLASH}/.harness/acks.txt" Enter
+  psmux_send_message "$SESSION" "HANDSHAKE 재시도: Bash 도구로 실행: echo '${SESSION}_ACK' >> ${WIN_PROJECT_DIR_SLASH}/.harness/acks.txt"
   for i in $(seq 1 6); do
     sleep 5
     if grep -q "${SESSION}_ACK" "$ACK_FILE" 2>/dev/null; then
@@ -311,7 +316,7 @@ fi
 
 if [ -n "$INJECT_FILE" ] && [ -f "$INJECT_FILE" ]; then
   sleep 2
-  "$PSMUX" send-keys -t "$SESSION" "Read ${INJECT_FILE} and follow all instructions inside. This is your role assignment." Enter
+  psmux_send_message "$SESSION" "Read ${INJECT_FILE} and follow all instructions inside. This is your role assignment."
   echo "[spawn:${SESSION}] Role injected: ${INJECT_FILE}"
 else
   echo "[spawn:${SESSION}] No role/protocol file — skipping"
@@ -335,16 +340,15 @@ if [ "$SESSION" = "ruler" ]; then
   # (b) pane 입력 버퍼 클리어 — 이전 핸드셰이크/ACK 이후 남은 입력 잔여물 제거
   # (이 단계 없으면 send-keys 로 넣는 텍스트가 기존 프롬프트 입력에 append 되어 꼬인다)
   sleep 2
-  "$PSMUX" send-keys -t "$SESSION" Escape
+  psmux_send_key "$SESSION" Escape
   sleep 1
 
   # (b-2) /remote-control 먼저 — Claude Code UI 를 Remote Control active 로 전환.
-  # ⚠️ MSYS_NO_PATHCONV=1 필수: MSYS2 가 '/remote-control' 을 'C:/Program Files/Git/remote-control'
-  # 로 경로 변환해서 슬래시 명령이 아닌 일반 텍스트로 들어간다 (promotion-log K73).
+  # SSOT 헬퍼가 내부에서 MSYS_NO_PATHCONV=1 설정 → slash 경로변환 이슈 없음 (promotion-log K73).
   # INIT_MSG 보다 먼저 보내서 Claude Code UI 가 remote-control 상태로 전환된 뒤 초기화 지시가 흘러들어가도록 순서 고정.
   # WF 세션 (worker/verifier/healer/strategic) 은 의도적으로 이 블록을 타지 않는다 —
   # Supervisor 가 harness 컨텍스트를 전담하므로 remote control 등록 불필요.
-  MSYS_NO_PATHCONV=1 "$PSMUX" send-keys -t "$SESSION" '/remote-control' Enter
+  psmux_send_slash "$SESSION" '/remote-control'
   echo "[spawn:ruler] /remote-control sent (Remote Control active)"
   sleep 4
 
@@ -357,9 +361,7 @@ if [ "$SESSION" = "ruler" ]; then
 5. state.md 갱신 (cycle=1, updated=now, 이번 사이클 결과 요약, Active WF Contexts=비어있음, Open Issues 정리)
 6. log/\$(date +%Y-%m-%d).md 에 초기 사이클 기록 append
 7. 초기화 완료 후 대기 — .active 플래그가 없으면 wake.sh 가 패트롤 메시지를 보내지 않는다 (idle 모드). WF skill 이 .active 를 생성할 때까지 메시지 수신 없이 대기."
-  "$PSMUX" send-keys -t "$SESSION" "$INIT_MSG"
-  sleep 1
-  "$PSMUX" send-keys -t "$SESSION" Enter
+  psmux_send_message "$SESSION" "$INIT_MSG"
 
   # (c) wake.sh 백그라운드 구동 (disown 으로 부모 독립)
   if [ -x "/c/Users/jsh86/.claude/.ruler/wake.sh" ]; then

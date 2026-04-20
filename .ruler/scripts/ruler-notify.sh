@@ -43,6 +43,10 @@ set -u
 set -o pipefail
 
 SCRIPT_NAME="ruler-notify.sh"
+
+# SSOT psmux helper
+source "$HOME/.claude/scripts/lib/psmux-send.sh"
+
 FLAG_DIR="/d/projects/button/agent/.secretary/.post-compact-flag"
 TMP_DIR_WIN="C:/Users/jsh86/AppData/Local/Temp"
 TMP_DIR_MSYS="/c/Users/jsh86/AppData/Local/Temp"
@@ -254,7 +258,7 @@ else
   MSG="$FULL_SUMMARY"
 fi
 
-if ! psmux send-keys -t "$TARGET" "$MSG" Enter 2>/dev/null; then
+if ! psmux_send_message "$TARGET" "$MSG" 2>/dev/null; then
   log_stderr "ERROR: psmux send-keys failed to $TARGET"
   emit_audit "ruler_notify_send_failed" "$TARGET" "$SUMMARY"
   exit 5

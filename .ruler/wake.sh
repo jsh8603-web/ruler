@@ -5,6 +5,9 @@
 
 PSMUX="/c/Users/jsh86/AppData/Local/Microsoft/WinGet/Packages/marlocarlo.psmux_Microsoft.Winget.Source_8wekyb3d8bbwe/psmux.exe"
 SESSION="ruler"
+
+# SSOT psmux helper (PSMUX_BIN 으로 bridge)
+PSMUX_BIN="$PSMUX" source "$HOME/.claude/scripts/lib/psmux-send.sh"
 RULER_DIR="$HOME/.claude/.ruler"
 cd "$RULER_DIR" || exit 1
 mkdir -p .messages log
@@ -180,7 +183,5 @@ while true; do
    [cycle ${CYCLE}] HH:MM KST | candidates N (FP X%) | pending N/T urgent N/T | idle-strike N/3 | batch: YES/NO
    이상 발생 시 해당 확장필드만 추가 (violation:/T1:/T2:/batch: SPAWN). \"C1 SAME\" 등 축약 금지."
 
-  "$PSMUX" send-keys -t "$SESSION" "$MSG"
-  sleep 1
-  "$PSMUX" send-keys -t "$SESSION" Enter
+  psmux_send_message "$SESSION" "$MSG"
 done

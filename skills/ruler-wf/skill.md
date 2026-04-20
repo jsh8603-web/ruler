@@ -58,9 +58,8 @@ if "$PSMUX" has-session -t ruler 2>/dev/null; then
   - started: ${TS}
   - plan: ${PLAN_PATH:-N/A}
   → ~/.claude/.ruler/state.md 'Active WF Contexts' 에 추가. 다음 사이클부터 순찰 범위 포함."
-  "$PSMUX" send-keys -t ruler "$CONTEXT"
-  sleep 1
-  "$PSMUX" send-keys -t ruler Enter
+  source "$HOME/.claude/scripts/lib/psmux-send.sh"
+  psmux_send_message ruler "$CONTEXT"
 else
   # 최초 스폰
   bash /d/projects/button/agent/.secretary/.scripts/spawn-session.sh ruler
@@ -84,7 +83,8 @@ fi
 Ruler 가 자기 역할 수행 중 다른 세션이나 자기 자신에게 슬래시 명령(`/remote-control`, `/compact`, `/clear`)을 psmux 로 보낼 때는 **반드시 `MSYS_NO_PATHCONV=1` 프리픽스**를 붙인다. 없으면 MSYS2 가 앞 `/` 를 Git 설치 루트로 변환하여 일반 텍스트로 들어간다.
 
 ```bash
-MSYS_NO_PATHCONV=1 psmux send-keys -t {세션} '/remote-control' Enter
+source "$HOME/.claude/scripts/lib/psmux-send.sh"
+MSYS_NO_PATHCONV=1 psmux_send_slash {세션} '/remote-control'
 ```
 
 상세: [`~/.claude/skills/psmux-session/skill.md`](~/.claude/skills/psmux-session/skill.md) §슬래시 명령 전송 + promotion-log K73.

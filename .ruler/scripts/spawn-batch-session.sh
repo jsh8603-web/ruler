@@ -53,6 +53,9 @@ if [ ! -f "$PSMUX" ]; then
   fi
 fi
 
+# SSOT psmux helper (PSMUX_BIN 으로 bridge)
+PSMUX_BIN="$PSMUX" source "$HOME/.claude/scripts/lib/psmux-send.sh"
+
 # ── self-target 방지 ──
 CURRENT_SESSION="${PSMUX_SESSION:-}"
 if [ "$CURRENT_SESSION" = "$SESSION" ]; then
@@ -99,8 +102,10 @@ sleep 2
 # ── 3. cd + Claude 스폰 ──
 SYSTEM_PROMPT="Ruler Batch Session. 단수명 (작업 1회 후 self-terminate). cwd=~/.claude. 모델=opus. 먼저 plan 파일 frontmatter 의 mode 필드 확인 → mode=retrospective 면 SSOT=~/.claude/.ruler/retrospective-guide.md §Phase 3 (Phase A→B→Final→C), 그 외 / 필드 없음이면 SSOT=~/.claude/.ruler/t2-batch-resolver.md §Batch Resolver 6-Step. patrol 본체(ruler-wf/skill.md) 읽지 않음. 작업 완료 = psmux kill-session 으로 즉시 self-terminate."
 
+# psmux-raw-ok: bootstrap (cmd.exe pane before Claude launches)
 "$PSMUX" send-keys -t "$SESSION" "cd /d ${WIN_CWD}" Enter
 sleep 1
+# psmux-raw-ok: bootstrap (cmd.exe pane — claude launch command)
 "$PSMUX" send-keys -t "$SESSION" "set PSMUX_SESSION=${SESSION} && set MAX_THINKING_TOKENS=24000 && claude --dangerously-skip-permissions --model claude-opus-4-7[1m] --system-prompt \"${SYSTEM_PROMPT}\"" Enter
 echo "[batch-spawn] Claude spawning..."
 
@@ -121,21 +126,21 @@ for i in $(seq 1 75); do
   if [ "$TRUST_HANDLED" = false ] && echo "$PANE_NS" | grep -qi "trustthisfolder"; then
     CURSOR_LINE=$(echo "$PANE_NS" | grep "❯" | head -1)
     if echo "$CURSOR_LINE" | grep -qi "yes"; then
-      "$PSMUX" send-keys -t "$SESSION" Enter
+      psmux_send_key "$SESSION" Enter
     elif echo "$CURSOR_LINE" | grep -qi "no"; then
       YES_LINE=$(echo "$PANE_NS" | grep -in "yes,itrust\|yes.*trust" | head -1 | cut -d: -f1)
       NO_LINE=$(echo "$PANE_NS" | grep -in "no,exit\|no.*exit" | head -1 | cut -d: -f1)
       if [ -n "$YES_LINE" ] && [ -n "$NO_LINE" ] && [ "$YES_LINE" -lt "$NO_LINE" ]; then
-        "$PSMUX" send-keys -t "$SESSION" Up
+        psmux_send_key "$SESSION" Up
       else
-        "$PSMUX" send-keys -t "$SESSION" Down
+        psmux_send_key "$SESSION" Down
       fi
       sleep 1
-      "$PSMUX" send-keys -t "$SESSION" Enter
+      psmux_send_key "$SESSION" Enter
     else
-      "$PSMUX" send-keys -t "$SESSION" Up
+      psmux_send_key "$SESSION" Up
       sleep 1
-      "$PSMUX" send-keys -t "$SESSION" Enter
+      psmux_send_key "$SESSION" Enter
     fi
     TRUST_HANDLED=true
     sleep 2
@@ -149,8 +154,8 @@ fi
 sleep 2
 
 # ── 5. /remote-control (UI 상태 전환) ──
-# MSYS_NO_PATHCONV=1 필수 — MSYS2 가 '/remote-control' 을 경로로 변환하지 않도록.
-MSYS_NO_PATHCONV=1 "$PSMUX" send-keys -t "$SESSION" '/remote-control' Enter
+# SSOT 헬퍼가 내부에서 MSYS_NO_PATHCONV=1 설정 → slash 경로변환 이슈 없음.
+psmux_send_slash "$SESSION" '/remote-control'
 echo "[batch-spawn] /remote-control sent"
 sleep 4
 
@@ -167,12 +172,10 @@ if [ -x "$SAFE_SEND" ]; then
   bash "$SAFE_SEND" "$SESSION" "$INIT_MSG" --file "$PLAN_FILE_MSYS"
   echo "[batch-spawn] Init prompt sent via psmux-safe-send.sh"
 else
-  # fallback: 래퍼 없으면 단일 라인으로 압축 + 분리 송신
+  # fallback: 래퍼 없으면 단일 라인으로 압축 + SSOT 헬퍼 송신
   echo "[batch-spawn] WARNING: psmux-safe-send.sh not found, using fallback" >&2
   COMPACT_MSG="${INIT_MSG} -- Read ${PLAN_FILE_MSYS}"
-  "$PSMUX" send-keys -t "$SESSION" "$COMPACT_MSG"
-  sleep 1
-  "$PSMUX" send-keys -t "$SESSION" Enter
+  psmux_send_message "$SESSION" "$COMPACT_MSG"
 fi
 
 echo "[batch-spawn] DONE (session=${SESSION}, plan=${PLAN_FILE_MSYS}, model=opus)"

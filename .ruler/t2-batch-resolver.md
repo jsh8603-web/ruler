@@ -37,7 +37,7 @@ tags: [ruler, gate, batch, t2, load/on-demand]
 - Edit 직후 `.ruler/decisions.jsonl` 1줄 append
 - Edit 후 즉시 `.ruler/log/{date}.md` diff inline 기록
 - secretary.js/revive.sh 등 계열 파일이면 `run-all.sh` 즉시 실행
-- secretary.js/revive.sh/bash-guard.js/generate-session-resume.sh 수정 후 `run-all.sh` PASS 확인되면 **Node.js secretary 프로세스 반드시 재시작**: `psmux send-keys -t btn-button 'cd /d/projects/button && node agent/secretary.js' Enter` (또는 `revive.sh` 경유)
+- secretary.js/revive.sh/bash-guard.js/generate-session-resume.sh 수정 후 `run-all.sh` PASS 확인되면 **Node.js secretary 프로세스 반드시 재시작**: `source "$HOME/.claude/scripts/lib/psmux-send.sh" && psmux_send_message btn-button "cd /d/projects/button && node agent/secretary.js"` (또는 `revive.sh` 경유)
 
 ## T2 (Grouped 묶음 수정)
 
